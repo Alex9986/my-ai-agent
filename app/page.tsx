@@ -1,12 +1,14 @@
 "use client";
 
 import { useState, useCallback, useEffect, useRef } from "react";
-import { Menu, X, Sparkles, Moon, Sun } from "lucide-react";
+import { Menu, X, Sparkles, Moon, Sun, LogOut } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import ChatPanel from "@/app/components/chat/chat-panel";
 import TodoPanel from "@/app/components/todo/todo-panel";
+import LoginForm from "@/app/components/auth/login-form";
 import { ChatMessage, Task } from "@/lib/types";
 import { useLocalTasks } from "@/app/hooks/use-local-tasks";
+import { useAuth } from "@/app/hooks/use-auth";
 import { cn } from "@/lib/utils";
 
 type MobileView = "chat" | "todo";
@@ -22,6 +24,9 @@ export default function Home() {
     updateTask,
     replaceAllTasks,
   } = useLocalTasks();
+
+  // --- Auth state ---
+  const { user, isLoading: authLoading, isAuthenticated, login, logout } = useAuth();
 
   // --- Chat state ---
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -149,6 +154,27 @@ export default function Home() {
     [updateTask]
   );
 
+  // --- Auth loading state ---
+  if (authLoading) {
+    return (
+      <div className="flex items-center justify-center h-screen bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <div className="w-8 h-8 rounded-full border-2 border-primary/30 border-t-primary animate-spin" />
+          <p className="text-sm text-muted-foreground">加载中...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // --- Unauthenticated state ---
+  if (!isAuthenticated) {
+    return (
+      <div className="flex items-center justify-center min-h-screen bg-background">
+        <LoginForm onLogin={login} />
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col h-screen bg-background">
       {/* Top bar */}
@@ -179,6 +205,18 @@ export default function Home() {
               ) : (
                 <Moon className="w-4 h-4" />
               )}
+            </Button>
+
+            {/* User & Logout */}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 rounded-lg text-xs gap-1.5"
+              onClick={logout}
+              title={`当前用户: ${user?.username}`}
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">{user?.username}</span>
             </Button>
 
             {/* Mobile view toggle */}
