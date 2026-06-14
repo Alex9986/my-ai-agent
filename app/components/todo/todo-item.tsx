@@ -6,11 +6,11 @@ import {
   Tag,
   CheckCircle2,
   Circle,
+  PlayCircle,
   Trash2,
   Edit3,
   AlertCircle,
   Clock,
-  MoreHorizontal,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,7 @@ interface TodoItemProps {
   task: Task;
   onComplete: (id: string, completed: boolean) => void;
   onDelete: (id: string) => void;
+  onEdit: (task: Task) => void;
 }
 
 const priorityConfig = {
@@ -48,9 +49,10 @@ const priorityConfig = {
   },
 };
 
-export default function TodoItem({ task, onComplete, onDelete }: TodoItemProps) {
+export default function TodoItem({ task, onComplete, onDelete, onEdit }: TodoItemProps) {
   const [showActions, setShowActions] = useState(false);
   const isCompleted = task.status === "completed";
+  const isInProgress = task.status === "in_progress";
   const pConfig = priorityConfig[task.priority];
 
   const Icon = pConfig.icon;
@@ -105,6 +107,9 @@ export default function TodoItem({ task, onComplete, onDelete }: TodoItemProps) 
         "group relative rounded-xl border p-3.5 transition-all duration-200",
         "hover:shadow-md hover:border-indigo-200 dark:hover:border-indigo-800",
         isCompleted ? "opacity-60" : "",
+        isInProgress && !isCompleted
+          ? "border-l-4 border-l-indigo-500 dark:border-l-indigo-400"
+          : "border-l",
         pConfig.bg
       )}
       onMouseEnter={() => setShowActions(true)}
@@ -118,11 +123,15 @@ export default function TodoItem({ task, onComplete, onDelete }: TodoItemProps) 
             "flex-shrink-0 mt-0.5 transition-colors",
             isCompleted
               ? "text-emerald-500 hover:text-emerald-600"
-              : "text-muted-foreground/40 hover:text-emerald-500"
+              : isInProgress
+                ? "text-indigo-500 hover:text-indigo-600"
+                : "text-muted-foreground/40 hover:text-emerald-500"
           )}
         >
           {isCompleted ? (
             <CheckCircle2 className="w-5 h-5" />
+          ) : isInProgress ? (
+            <PlayCircle className="w-5 h-5" />
           ) : (
             <Circle className="w-5 h-5" />
           )}
@@ -149,6 +158,14 @@ export default function TodoItem({ task, onComplete, onDelete }: TodoItemProps) 
                 showActions ? "opacity-100" : "opacity-0"
               )}
             >
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-7 w-7 rounded-lg hover:bg-background/80"
+                onClick={() => onEdit(task)}
+              >
+                <Edit3 className="w-3.5 h-3.5 text-muted-foreground hover:text-indigo-500" />
+              </Button>
               <Button
                 variant="ghost"
                 size="icon"

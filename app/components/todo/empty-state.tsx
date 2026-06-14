@@ -13,8 +13,12 @@ export default function EmptyState({ filter }: EmptyStateProps) {
       description: "通过左侧对话告诉 AI 你想添加什么任务吧！",
     },
     pending: {
-      title: "所有任务都完成了！",
-      description: "太棒了！通过对话添加更多任务吧。",
+      title: "没有待办任务",
+      description: "所有未开始的任务都已在进行中或完成了。",
+    },
+    in_progress: {
+      title: "没有进行中的任务",
+      description: "选择一个待办任务开始执行吧！",
     },
     completed: {
       title: "还没有已完成的任务",

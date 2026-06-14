@@ -26,6 +26,6 @@ export interface ChatResponse {
   tasks: Task[];
 }
 
-export type TaskFilter = "all" | "pending" | "completed";
+export type TaskFilter = "all" | "pending" | "in_progress" | "completed";
 
 export type PriorityFilter = "all" | "high" | "medium" | "low";

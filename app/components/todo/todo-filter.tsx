@@ -2,7 +2,13 @@
 
 import { cn } from "@/lib/utils";
 import { TaskFilter as TaskFilterType } from "@/lib/types";
-import { ListTodo, CheckCircle2, AlertCircle, Clock, Circle } from "lucide-react";
+import {
+  ListTodo,
+  CheckCircle2,
+  AlertCircle,
+  Clock,
+  PlayCircle,
+} from "lucide-react";
 
 interface TodoFilterProps {
   currentFilter: TaskFilterType;
@@ -10,6 +16,7 @@ interface TodoFilterProps {
   counts: {
     all: number;
     pending: number;
+    in_progress: number;
     completed: number;
   };
 }
@@ -21,6 +28,7 @@ const filters: {
 }[] = [
   { key: "all", label: "全部", icon: ListTodo },
   { key: "pending", label: "待办", icon: Clock },
+  { key: "in_progress", label: "进行中", icon: PlayCircle },
   { key: "completed", label: "已完成", icon: CheckCircle2 },
 ];
 
@@ -30,13 +38,13 @@ export default function TodoFilter({
   counts,
 }: TodoFilterProps) {
   return (
-    <div className="flex gap-1 p-1 rounded-xl bg-muted/60">
+    <div className="flex gap-1 p-1 rounded-xl bg-muted/60 flex-wrap">
       {filters.map(({ key, label, icon: Icon }) => (
         <button
           key={key}
           onClick={() => onFilterChange(key)}
           className={cn(
-            "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all duration-200",
+            "flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-xs font-medium transition-all duration-200",
             currentFilter === key
               ? "bg-background text-foreground shadow-sm"
               : "text-muted-foreground hover:text-foreground hover:bg-background/50"

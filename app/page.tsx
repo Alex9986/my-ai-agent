@@ -140,6 +140,23 @@ export default function Home() {
     }
   }, []);
 
+  const handleUpdate = useCallback(
+    async (id: string, updates: Partial<Task>) => {
+      try {
+        const res = await fetch(`/api/tasks/${id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(updates),
+        });
+        const data = await res.json();
+        if (data.tasks) setTasks(data.tasks);
+      } catch (error) {
+        console.error("Failed to update task:", error);
+      }
+    },
+    []
+  );
+
   return (
     <div className="flex flex-col h-screen bg-background">
       {/* Top bar */}
@@ -224,6 +241,7 @@ export default function Home() {
             tasks={tasks}
             onComplete={handleComplete}
             onDelete={handleDelete}
+            onUpdate={handleUpdate}
           />
         </div>
       </div>
