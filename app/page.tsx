@@ -6,29 +6,32 @@ import { Button } from "@/components/ui/button";
 import ChatPanel from "@/app/components/chat/chat-panel";
 import TodoPanel from "@/app/components/todo/todo-panel";
 import { ChatMessage, Task } from "@/lib/types";
+import { useLocalTasks } from "@/app/hooks/use-local-tasks";
 import { cn } from "@/lib/utils";
 
 type MobileView = "chat" | "todo";
 
 export default function Home() {
-  // State
+  // --- Task state (client-side localStorage) ---
+  const {
+    tasks,
+    tasksRef,
+    ready,
+    completeTask,
+    deleteTask,
+    updateTask,
+    replaceAllTasks,
+  } = useLocalTasks();
+
+  // --- Chat state ---
   const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
   const [loading, setLoading] = useState(false);
+
+  // --- UI state ---
   const [mobileView, setMobileView] = useState<MobileView>("chat");
   const [darkMode, setDarkMode] = useState(false);
 
-  // Load initial tasks
-  useEffect(() => {
-    fetch("/api/tasks")
-      .then((res) => res.json())
-      .then((data) => {
-        if (data.tasks) setTasks(data.tasks);
-      })
-      .catch(console.error);
-  }, []);
-
-  // Dark mode
+  // --- Dark mode ---
   useEffect(() => {
     const isDark = document.documentElement.classList.contains("dark");
     setDarkMode(isDark);
@@ -41,7 +44,6 @@ export default function Home() {
     localStorage.setItem("theme", newDark ? "dark" : "light");
   };
 
-  // Initialize dark mode from localStorage
   useEffect(() => {
     const stored = localStorage.getItem("theme");
     if (stored === "dark") {
@@ -53,108 +55,98 @@ export default function Home() {
     }
   }, []);
 
-  // Ref to track latest messages (avoids stale closure)
+  // --- Ref to track latest messages & tasks (avoids stale closures) ---
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
 
-  // Send message to AI
-  const handleSend = useCallback(async (content: string) => {
-    const currentMessages = messagesRef.current;
-    const userMessage: ChatMessage = {
-      id: crypto.randomUUID(),
-      role: "user",
-      content,
-      timestamp: new Date().toISOString(),
-    };
+  // --- Send message to AI ---
+  const handleSend = useCallback(
+    async (content: string) => {
+      const currentMessages = messagesRef.current;
+      const currentTasks = tasksRef.current;
+      const userMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "user",
+        content,
+        timestamp: new Date().toISOString(),
+      };
 
-    const newMessages = [...currentMessages, userMessage];
-    setMessages(newMessages);
-    setLoading(true);
+      const newMessages = [...currentMessages, userMessage];
+      setMessages(newMessages);
+      setLoading(true);
 
-    try {
-      const response = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          messages: newMessages.map((m) => ({
-            role: m.role,
-            content: m.content,
-          })),
-        }),
-      });
+      try {
+        const response = await fetch("/api/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: newMessages.map((m) => ({
+              role: m.role,
+              content: m.content,
+            })),
+            // Send current tasks so the server can provide context + execute tool calls
+            tasks: currentTasks,
+            // Send browser timezone so the AI understands the user's local time
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          }),
+        });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || "请求失败");
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error || "请求失败");
+        }
+
+        const data = await response.json();
+
+        const assistantMessage: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: data.message,
+          timestamp: new Date().toISOString(),
+        };
+
+        setMessages((prev) => [...prev, assistantMessage]);
+
+        // Update localStorage with the server-returned task list
+        if (data.tasks) {
+          replaceAllTasks(data.tasks);
+        }
+      } catch (error) {
+        const errorMessage: ChatMessage = {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content:
+            "抱歉，出了点问题 😅 请检查 API Key 是否正确配置，然后重试。",
+          timestamp: new Date().toISOString(),
+        };
+        setMessages((prev) => [...prev, errorMessage]);
+      } finally {
+        setLoading(false);
       }
+    },
+    [replaceAllTasks, tasksRef]
+  );
 
-      const data = await response.json();
+  // --- Direct task actions (localStorage, no server round-trip) ---
+  const handleComplete = useCallback(
+    (id: string, completed: boolean) => {
+      completeTask(id, completed);
+    },
+    [completeTask]
+  );
 
-      const assistantMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content: data.message,
-        timestamp: new Date().toISOString(),
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-      if (data.tasks) setTasks(data.tasks);
-    } catch (error) {
-      const errorMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "assistant",
-        content:
-          "抱歉，出了点问题 😅 请检查 API Key 是否正确配置，然后重试。",
-        timestamp: new Date().toISOString(),
-      };
-      setMessages((prev) => [...prev, errorMessage]);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // Direct task actions (no AI call)
-  const handleComplete = useCallback(async (id: string, completed: boolean) => {
-    try {
-      const res = await fetch(`/api/tasks/${id}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ completed }),
-      });
-      const data = await res.json();
-      if (data.tasks) setTasks(data.tasks);
-    } catch (error) {
-      console.error("Failed to update task:", error);
-    }
-  }, []);
-
-  const handleDelete = useCallback(async (id: string) => {
-    try {
-      const res = await fetch(`/api/tasks/${id}`, {
-        method: "DELETE",
-      });
-      const data = await res.json();
-      if (data.tasks) setTasks(data.tasks);
-    } catch (error) {
-      console.error("Failed to delete task:", error);
-    }
-  }, []);
+  const handleDelete = useCallback(
+    (id: string) => {
+      deleteTask(id);
+    },
+    [deleteTask]
+  );
 
   const handleUpdate = useCallback(
     async (id: string, updates: Partial<Task>) => {
-      try {
-        const res = await fetch(`/api/tasks/${id}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(updates),
-        });
-        const data = await res.json();
-        if (data.tasks) setTasks(data.tasks);
-      } catch (error) {
-        console.error("Failed to update task:", error);
-      }
+      updateTask(id, updates);
     },
-    []
+    [updateTask]
   );
 
   return (

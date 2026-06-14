@@ -19,6 +19,8 @@ export interface ChatMessage {
 
 export interface ChatRequest {
   messages: Pick<ChatMessage, "role" | "content">[];
+  tasks: Task[];
+  timezone: string;
 }
 
 export interface ChatResponse {

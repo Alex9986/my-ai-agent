@@ -36,7 +36,10 @@ interface DeepSeekResponse {
 
 const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
 
-const SYSTEM_PROMPT = `你是一个友好的 Todo List 助手，名叫"小助手"。你可以帮助用户管理他们的任务列表。
+function buildSystemPrompt(timezone: string): string {
+  const now = new Date().toLocaleString("zh-CN", { timeZone: timezone });
+
+  return `你是一个友好的 Todo List 助手，名叫"小助手"。你可以帮助用户管理他们的任务列表。
 
 用户可以用自然语言与你交流，你需要理解他们的意图，并通过调用函数来执行操作。
 
@@ -62,8 +65,10 @@ const SYSTEM_PROMPT = `你是一个友好的 Todo List 助手，名叫"小助手
 - 如果用户只是聊天，就友好地聊天
 - 如果用户的问题不涉及任务操作，直接回答即可
 
-当前日期时间：${new Date().toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}
-请根据当前日期理解用户说的"明天"、"下周"等相对时间。`;
+当前日期时间：${now}
+请根据当前日期理解用户说的"明天"、"下周"等相对时间。
+用户所在的时区是 ${timezone}，所有截止日期请基于此时区计算。`;
+}
 
 const TOOLS: DeepSeekTool[] = [
   {
@@ -216,7 +221,8 @@ export interface DeepSeekCallResult {
 
 export async function callDeepSeek(
   messages: { role: string; content: string }[],
-  currentTasks: Record<string, unknown>[]
+  currentTasks: Record<string, unknown>[],
+  timezone: string
 ): Promise<DeepSeekCallResult> {
   const apiKey = process.env.DEEPSEEK_API_KEY;
   if (!apiKey) {
@@ -229,8 +235,10 @@ export async function callDeepSeek(
       ? `\n\n当前用户的任务列表（JSON格式，供你参考）：\n${JSON.stringify(currentTasks, null, 2)}\n\n当用户提到"这个任务"、"刚才那个"等模糊指代时，请根据对话上下文和这个任务列表来判断具体是哪个任务。`
       : "\n\n用户当前没有任何任务。";
 
+  const systemPrompt = buildSystemPrompt(timezone);
+
   const chatMessages: DeepSeekMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT + taskContext },
+    { role: "system", content: systemPrompt + taskContext },
     ...messages.map((m) => ({
       role: m.role as DeepSeekMessage["role"],
       content: m.content,
