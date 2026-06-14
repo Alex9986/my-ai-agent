@@ -7,7 +7,6 @@ import {
   deleteTask,
   completeTask,
   findTasks,
-  saveAllTasks,
 } from "@/lib/task-store";
 import { Task, ChatRequest, ChatResponse } from "@/lib/types";
 
@@ -23,7 +22,7 @@ export async function POST(request: NextRequest) {
     }
 
     // Get current tasks for context
-    const currentTasks = getAllTasks();
+    const currentTasks = await getAllTasks();
 
     // Sort tasks to match the Todo panel display order:
     // incomplete first (priority: high → medium → low), then completed
@@ -67,7 +66,7 @@ export async function POST(request: NextRequest) {
             createdAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
-          updatedTasks = addTask(newTask);
+          updatedTasks = await addTask(newTask);
           break;
         }
 
@@ -82,20 +81,20 @@ export async function POST(request: NextRequest) {
           if (args.dueDate !== undefined)
             updates.dueDate = args.dueDate as string;
           if (args.tags !== undefined) updates.tags = args.tags as string[];
-          updatedTasks = updateTask(id, updates);
+          updatedTasks = await updateTask(id, updates);
           break;
         }
 
         case "delete_task": {
           const id = args.id as string;
-          updatedTasks = deleteTask(id);
+          updatedTasks = await deleteTask(id);
           break;
         }
 
         case "complete_task": {
           const id = args.id as string;
           const completed = args.completed as boolean;
-          updatedTasks = completeTask(id, completed);
+          updatedTasks = await completeTask(id, completed);
           break;
         }
 
@@ -107,16 +106,17 @@ export async function POST(request: NextRequest) {
           });
           // For list_tasks, we don't modify tasks, just let the AI report back
           // But we ensure updatedTasks is set
-          updatedTasks = getAllTasks();
-          // Overwrite the result message to include filtered info
-          // (the AI will have already described the results)
+          // list_tasks: no modifications — tasks come from the filtered query
+          // but we return the full list so the UI stays consistent
+          updatedTasks = await getAllTasks();
           break;
         }
       }
     }
 
-    // If no tool calls, just get current tasks
-    updatedTasks = getAllTasks();
+    // If no tool calls were executed, keep the current task snapshot.
+    // (When tool calls did execute, updatedTasks is already correct from the
+    // switch cases above — no need to re-read from disk.)
 
     const response: ChatResponse = {
       message: result.message,

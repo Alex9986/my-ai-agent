@@ -11,12 +11,12 @@ export async function PATCH(
 
     // Handle completion toggle
     if (typeof body.completed === "boolean") {
-      const tasks = completeTask(id, body.completed);
+      const tasks = await completeTask(id, body.completed);
       return NextResponse.json({ tasks });
     }
 
     // Handle general update
-    const tasks = updateTask(id, body);
+    const tasks = await updateTask(id, body);
     return NextResponse.json({ tasks });
   } catch (error) {
     return NextResponse.json(
@@ -32,7 +32,7 @@ export async function DELETE(
 ) {
   try {
     const { id } = await context.params;
-    const tasks = deleteTask(id);
+    const tasks = await deleteTask(id);
     return NextResponse.json({ tasks });
   } catch (error) {
     return NextResponse.json(

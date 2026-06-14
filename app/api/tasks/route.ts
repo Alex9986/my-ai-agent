@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAllTasks, addTask, saveAllTasks } from "@/lib/task-store";
+import { getAllTasks, addTask } from "@/lib/task-store";
 import { Task } from "@/lib/types";
 
 export async function GET() {
   try {
-    const tasks = getAllTasks();
+    const tasks = await getAllTasks();
     return NextResponse.json({ tasks });
   } catch (error) {
     return NextResponse.json(
@@ -28,7 +28,7 @@ export async function POST(request: NextRequest) {
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    const tasks = addTask(newTask);
+    const tasks = await addTask(newTask);
     return NextResponse.json({ task: newTask, tasks });
   } catch (error) {
     return NextResponse.json(

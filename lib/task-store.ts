@@ -1,86 +1,214 @@
 import { Task } from "@/lib/types";
-import fs from "fs";
+import fs from "fs/promises";
 import path from "path";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const TASKS_FILE = path.join(DATA_DIR, "tasks.json");
 
-function ensureDataDir(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+// ============================================================
+// In-memory cache
+// ============================================================
+// Holds the canonical task array. On first load, reads from disk.
+// Write operations update both the cache and the file atomically.
+let cache: Task[] | null = null;
+
+// ============================================================
+// Mutex — serializes all file reads/writes to prevent races
+// ============================================================
+class Mutex {
+  private _locked = false;
+  private _queue: (() => void)[] = [];
+
+  acquire(): Promise<void> {
+    if (!this._locked) {
+      this._locked = true;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this._queue.push(resolve);
+    });
   }
-  if (!fs.existsSync(TASKS_FILE)) {
-    fs.writeFileSync(TASKS_FILE, "[]", "utf-8");
+
+  release(): void {
+    if (this._queue.length > 0) {
+      const next = this._queue.shift()!;
+      next();
+    } else {
+      this._locked = false;
+    }
   }
 }
 
-export function getAllTasks(): Task[] {
-  ensureDataDir();
-  const raw = fs.readFileSync(TASKS_FILE, "utf-8");
+const lock = new Mutex();
+
+// ============================================================
+// Internal helpers (not exported — callers go through the lock)
+// ============================================================
+
+async function ensureDataDir(): Promise<void> {
+  try {
+    await fs.access(DATA_DIR);
+  } catch {
+    await fs.mkdir(DATA_DIR, { recursive: true });
+  }
+  try {
+    await fs.access(TASKS_FILE);
+  } catch {
+    await fs.writeFile(TASKS_FILE, "[]", "utf-8");
+  }
+}
+
+async function readFromDisk(): Promise<Task[]> {
+  await ensureDataDir();
+  const raw = await fs.readFile(TASKS_FILE, "utf-8");
   return JSON.parse(raw) as Task[];
 }
 
-export function saveAllTasks(tasks: Task[]): void {
-  ensureDataDir();
-  fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2), "utf-8");
+async function writeToDisk(tasks: Task[]): Promise<void> {
+  await ensureDataDir();
+  // Atomic-ish: write to a temp file then rename
+  const tmpFile = TASKS_FILE + ".tmp";
+  await fs.writeFile(tmpFile, JSON.stringify(tasks, null, 2), "utf-8");
+  await fs.rename(tmpFile, TASKS_FILE);
+  cache = tasks;
 }
 
-export function addTask(task: Task): Task[] {
-  const tasks = getAllTasks();
-  tasks.push(task);
-  saveAllTasks(tasks);
-  return tasks;
+// ============================================================
+// Public API — all functions are async
+// ============================================================
+
+/**
+ * Return all tasks (from cache if populated, otherwise load from disk).
+ * The returned array is a shallow copy — mutating it won't corrupt the cache.
+ */
+export async function getAllTasks(): Promise<Task[]> {
+  // Fast path: cache is already populated
+  if (cache !== null) {
+    return [...cache];
+  }
+
+  // Slow path: first load — go through the lock
+  await lock.acquire();
+  try {
+    // Double-check: another request may have loaded while we waited
+    if (cache !== null) {
+      return [...cache];
+    }
+    cache = await readFromDisk();
+    return [...cache];
+  } finally {
+    lock.release();
+  }
 }
 
-export function updateTask(id: string, updates: Partial<Omit<Task, "id" | "createdAt">>): Task[] {
-  const tasks = getAllTasks();
-  const index = tasks.findIndex((t) => t.id === id);
-  if (index === -1) return tasks;
-  tasks[index] = {
-    ...tasks[index],
-    ...updates,
-    updatedAt: new Date().toISOString(),
-  };
-  saveAllTasks(tasks);
-  return tasks;
+/**
+ * Add a new task and persist.
+ */
+export async function addTask(task: Task): Promise<Task[]> {
+  await lock.acquire();
+  try {
+    const tasks = cache !== null ? [...cache] : await readFromDisk();
+    tasks.push(task);
+    await writeToDisk(tasks);
+    return [...tasks];
+  } finally {
+    lock.release();
+  }
 }
 
-export function deleteTask(id: string): Task[] {
-  let tasks = getAllTasks();
-  tasks = tasks.filter((t) => t.id !== id);
-  saveAllTasks(tasks);
-  return tasks;
+/**
+ * Update an existing task by id.  `updates` is merged on top of the
+ * existing record (except `id` and `createdAt`, which are immutable).
+ */
+export async function updateTask(
+  id: string,
+  updates: Partial<Omit<Task, "id" | "createdAt">>
+): Promise<Task[]> {
+  await lock.acquire();
+  try {
+    const tasks = cache !== null ? [...cache] : await readFromDisk();
+    const index = tasks.findIndex((t) => t.id === id);
+    if (index === -1) {
+      return [...tasks]; // not found — return unchanged
+    }
+    tasks[index] = {
+      ...tasks[index],
+      ...updates,
+      updatedAt: new Date().toISOString(),
+    };
+    await writeToDisk(tasks);
+    return [...tasks];
+  } finally {
+    lock.release();
+  }
 }
 
-export function completeTask(id: string, completed: boolean): Task[] {
-  const tasks = getAllTasks();
-  const index = tasks.findIndex((t) => t.id === id);
-  if (index === -1) return tasks;
-  tasks[index] = {
-    ...tasks[index],
-    status: completed ? "completed" : "pending",
-    updatedAt: new Date().toISOString(),
-  };
-  saveAllTasks(tasks);
-  return tasks;
+/**
+ * Delete a task by id.
+ */
+export async function deleteTask(id: string): Promise<Task[]> {
+  await lock.acquire();
+  try {
+    const tasks = cache !== null ? [...cache] : await readFromDisk();
+    const filtered = tasks.filter((t) => t.id !== id);
+    if (filtered.length === tasks.length) {
+      return [...tasks]; // nothing deleted
+    }
+    await writeToDisk(filtered);
+    return [...filtered];
+  } finally {
+    lock.release();
+  }
 }
 
-export function findTasks(options: {
+/**
+ * Mark a task as completed or re-open it.
+ */
+export async function completeTask(
+  id: string,
+  completed: boolean
+): Promise<Task[]> {
+  await lock.acquire();
+  try {
+    const tasks = cache !== null ? [...cache] : await readFromDisk();
+    const index = tasks.findIndex((t) => t.id === id);
+    if (index === -1) {
+      return [...tasks];
+    }
+    tasks[index] = {
+      ...tasks[index],
+      status: completed ? "completed" : "pending",
+      updatedAt: new Date().toISOString(),
+    };
+    await writeToDisk(tasks);
+    return [...tasks];
+  } finally {
+    lock.release();
+  }
+}
+
+/**
+ * Search / filter tasks.  This is a pure read so it doesn't acquire the
+ * write lock — but it does a quick lock to load the cache on first call.
+ */
+export async function findTasks(options: {
   status?: string;
   priority?: string;
   search?: string;
-}): Task[] {
-  let tasks = getAllTasks();
+}): Promise<Task[]> {
+  const all = await getAllTasks(); // uses fast cache path after first load
+
+  let result = all;
 
   if (options.status && options.status !== "all") {
-    tasks = tasks.filter((t) => t.status === options.status);
+    result = result.filter((t) => t.status === options.status);
   }
   if (options.priority && options.priority !== "all") {
-    tasks = tasks.filter((t) => t.priority === options.priority);
+    result = result.filter((t) => t.priority === options.priority);
   }
   if (options.search) {
     const q = options.search.toLowerCase();
-    tasks = tasks.filter(
+    result = result.filter(
       (t) =>
         t.title.toLowerCase().includes(q) ||
         (t.description && t.description.toLowerCase().includes(q)) ||
@@ -88,5 +216,5 @@ export function findTasks(options: {
     );
   }
 
-  return tasks;
+  return result;
 }
