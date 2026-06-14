@@ -3,11 +3,11 @@
     "id": "5dd79604-dfe5-4ecd-86ce-c874b5a6be53",
     "title": "整理房间",
     "priority": "high",
-    "status": "pending",
+    "status": "completed",
     "dueDate": "2026-06-13T10:00:00",
     "tags": [],
     "createdAt": "2026-06-12T01:52:29.957Z",
-    "updatedAt": "2026-06-12T01:52:29.957Z"
+    "updatedAt": "2026-06-14T00:00:45.619Z"
   },
   {
     "id": "5757f4f6-a5bb-4958-8067-aec5ed051deb",
@@ -23,11 +23,11 @@
     "id": "7cb45ed1-b86b-4208-80db-c4b84ca36d37",
     "title": "学习编程一小时",
     "priority": "medium",
-    "status": "pending",
+    "status": "completed",
     "dueDate": "2026-06-13T09:00:00",
     "tags": [],
     "createdAt": "2026-06-12T01:52:29.961Z",
-    "updatedAt": "2026-06-12T01:52:29.961Z"
+    "updatedAt": "2026-06-14T00:00:37.705Z"
   },
   {
     "id": "e9b87805-5c85-4567-a51d-bf341f9aab90",
@@ -37,17 +37,17 @@
     "dueDate": "2026-06-13T19:00:00",
     "tags": [],
     "createdAt": "2026-06-12T01:52:29.963Z",
-    "updatedAt": "2026-06-12T01:52:29.963Z"
+    "updatedAt": "2026-06-14T00:08:37.646Z"
   },
   {
     "id": "46a510aa-addd-4eeb-82f2-7c8e5fcccafa",
     "title": "写周记",
     "priority": "high",
-    "status": "pending",
+    "status": "completed",
     "dueDate": "2026-06-13T22:00:00",
     "tags": [],
     "createdAt": "2026-06-12T01:52:29.966Z",
-    "updatedAt": "2026-06-12T01:52:29.966Z"
+    "updatedAt": "2026-06-14T00:00:47.870Z"
   },
   {
     "id": "103cf24d-0b10-4ea3-8856-f41abfe79c13",
