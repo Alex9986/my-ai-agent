@@ -7,14 +7,17 @@ import ChatPanel from "@/app/components/chat/chat-panel";
 import TodoPanel from "@/app/components/todo/todo-panel";
 import LoginForm from "@/app/components/auth/login-form";
 import { ChatMessage, Task } from "@/lib/types";
-import { useLocalTasks } from "@/app/hooks/use-local-tasks";
+import { useTasks } from "@/app/hooks/use-tasks";
 import { useAuth } from "@/app/hooks/use-auth";
 import { cn } from "@/lib/utils";
 
 type MobileView = "chat" | "todo";
 
 export default function Home() {
-  // --- Task state (client-side localStorage) ---
+  // --- Auth state ---
+  const { user, isLoading: authLoading, isAuthenticated, login, logout } = useAuth();
+
+  // --- Task state (server-synced per user, localStorage cached) ---
   const {
     tasks,
     tasksRef,
@@ -23,10 +26,7 @@ export default function Home() {
     deleteTask,
     updateTask,
     replaceAllTasks,
-  } = useLocalTasks();
-
-  // --- Auth state ---
-  const { user, isLoading: authLoading, isAuthenticated, login, logout } = useAuth();
+  } = useTasks(user?.username ?? null);
 
   // --- Chat state ---
   const [messages, setMessages] = useState<ChatMessage[]>([]);

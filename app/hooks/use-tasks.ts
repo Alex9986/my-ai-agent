@@ -60,35 +60,89 @@ function saveToStorage(tasks: Task[]): void {
   }
 }
 
-export function useLocalTasks() {
+export function useTasks(username: string | null) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [ready, setReady] = useState(false);
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
 
-  // Load on mount
+  // --- Load tasks from server (with localStorage fallback) on username change ---
   useEffect(() => {
-    const existing = loadFromStorage();
-    if (existing && existing.length > 0) {
-      setTasks(existing);
-    } else {
-      // First visit — seed with sample tasks
-      saveToStorage(SAMPLE_TASKS);
-      setTasks(SAMPLE_TASKS);
-    }
-    setReady(true);
-  }, []);
+    let cancelled = false;
 
-  // Auto-save whenever tasks change (skip initial load)
+    async function load() {
+      if (!username) {
+        setTasks([]);
+        setReady(false);
+        return;
+      }
+
+      setReady(false);
+
+      // Priority 1: Server fetch
+      try {
+        const res = await fetch(
+          `/api/tasks?username=${encodeURIComponent(username)}`
+        );
+        if (res.ok) {
+          const data = await res.json();
+          if (!cancelled && Array.isArray(data.tasks)) {
+            // Server has data (including empty array) — use it as-is
+            setTasks(data.tasks);
+            setReady(true);
+            return;
+          }
+        }
+        // Non-OK response — fall back to localStorage
+      } catch {
+        // Server unreachable — fall back to localStorage
+        console.warn("Failed to fetch tasks from server, trying localStorage...");
+      }
+
+      if (cancelled) return;
+
+      // Priority 2: localStorage cache (only used when server is unreachable)
+      const local = loadFromStorage();
+      if (local && local.length > 0) {
+        setTasks(local);
+        setReady(true);
+        return;
+      }
+
+      // Priority 3: Seed sample tasks
+      if (!cancelled) {
+        setTasks(SAMPLE_TASKS);
+        setReady(true);
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, [username]);
+
+  // --- Sync tasks to localStorage + server on every change ---
   const isInitialLoad = useRef(true);
   useEffect(() => {
+    // Skip the initial load (first state set from the load effect above)
     if (isInitialLoad.current) {
       isInitialLoad.current = false;
       return;
     }
-    saveToStorage(tasks);
-  }, [tasks]);
 
+    if (!username || !ready) return;
+
+    // Cache to localStorage
+    saveToStorage(tasks);
+
+    // Fire-and-forget sync to server
+    fetch("/api/tasks", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, tasks }),
+    }).catch((err) => console.error("Failed to sync tasks to server:", err));
+  }, [tasks, username, ready]);
+
+  // --- Mutation functions ---
   const completeTask = useCallback((id: string, completed: boolean) => {
     setTasks((prev) => {
       const index = prev.findIndex((t) => t.id === id);
