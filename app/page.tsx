@@ -9,6 +9,8 @@ import LoginForm from "@/app/components/auth/login-form";
 import { ChatMessage, Task } from "@/lib/types";
 import { useTasks } from "@/app/hooks/use-tasks";
 import { useAuth } from "@/app/hooks/use-auth";
+import { useToast } from "@/app/components/toast/toast-provider";
+import { useKeyboardShortcuts } from "@/app/hooks/use-keyboard-shortcuts";
 import { cn } from "@/lib/utils";
 
 type MobileView = "chat" | "todo";
@@ -16,6 +18,9 @@ type MobileView = "chat" | "todo";
 export default function Home() {
   // --- Auth state ---
   const { user, isLoading: authLoading, isAuthenticated, login, logout } = useAuth();
+
+  // --- Toast ---
+  const { toast } = useToast();
 
   // --- Task state (server-synced per user, localStorage cached) ---
   const {
@@ -63,6 +68,18 @@ export default function Home() {
   // --- Ref to track latest messages & tasks (avoids stale closures) ---
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+
+  // --- Keyboard shortcuts ---
+  useKeyboardShortcuts({
+    "ctrl+k": () => {
+      const el = document.querySelector<HTMLInputElement>('[data-shortcut="search"]');
+      el?.focus();
+    },
+    "ctrl+shift+k": () => {
+      const el = document.querySelector<HTMLTextAreaElement>('[data-shortcut="chat"]');
+      el?.focus();
+    },
+  });
 
   // --- Send message to AI ---
   const handleSend = useCallback(
@@ -115,6 +132,7 @@ export default function Home() {
         // Update localStorage with the server-returned task list
         if (data.tasks) {
           replaceAllTasks(data.tasks);
+          toast("AI 已更新任务列表", "success");
         }
       } catch (error) {
         const errorMessage: ChatMessage = {
@@ -125,6 +143,7 @@ export default function Home() {
           timestamp: new Date().toISOString(),
         };
         setMessages((prev) => [...prev, errorMessage]);
+        toast("AI 响应失败，请检查 API 配置", "error");
       } finally {
         setLoading(false);
       }
@@ -136,22 +155,34 @@ export default function Home() {
   const handleComplete = useCallback(
     (id: string, completed: boolean) => {
       completeTask(id, completed);
+      const task = tasksRef.current.find((t) => t.id === id);
+      if (task) {
+        toast(
+          completed ? `✅ "${task.title}" 已完成` : `↩️ "${task.title}" 已重新打开`,
+          "success"
+        );
+      }
     },
-    [completeTask]
+    [completeTask, tasksRef, toast]
   );
 
   const handleDelete = useCallback(
     (id: string) => {
+      const task = tasksRef.current.find((t) => t.id === id);
       deleteTask(id);
+      if (task) {
+        toast(`🗑️ "${task.title}" 已删除`, "info");
+      }
     },
-    [deleteTask]
+    [deleteTask, tasksRef, toast]
   );
 
   const handleUpdate = useCallback(
     async (id: string, updates: Partial<Task>) => {
       updateTask(id, updates);
+      toast("✅ 任务已更新", "success");
     },
-    [updateTask]
+    [updateTask, toast]
   );
 
   // --- Auth loading state ---

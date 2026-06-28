@@ -16,7 +16,7 @@ export default function TodoSearch({ value, onChange }: TodoSearchProps) {
         type="text"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        placeholder="搜索任务..."
+        placeholder="搜索任务... (Ctrl+K)"
         className={cn(
           "w-full h-8 pl-7.5 pr-7 rounded-lg text-xs",
           "bg-muted/60 border border-transparent",
@@ -24,6 +24,7 @@ export default function TodoSearch({ value, onChange }: TodoSearchProps) {
           "focus:outline-none focus:border-ring focus:ring-2 focus:ring-ring/30",
           "transition-all duration-200"
         )}
+        data-shortcut="search"
       />
       {value && (
         <button

@@ -50,8 +50,9 @@ export default function ChatInput({ onSend, disabled }: ChatInputProps) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder="输入你的消息，例如：帮我添加一个明天买咖啡的任务..."
+            placeholder="输入你的消息，例如：帮我添加一个明天买咖啡的任务... (Ctrl+Shift+K 聚焦)"
             disabled={disabled}
+            data-shortcut="chat"
             rows={1}
             className={cn(
               "min-h-[44px] max-h-[150px] resize-none pr-10",
