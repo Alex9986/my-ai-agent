@@ -15,6 +15,15 @@ import { cn } from "@/lib/utils";
 
 type MobileView = "chat" | "todo";
 
+/** Drops locally-generated failure notices from the tail of the conversation. */
+function dropTrailingErrors(list: ChatMessage[]): ChatMessage[] {
+  const next = [...list];
+  while (next.length > 0 && next[next.length - 1].isError) {
+    next.pop();
+  }
+  return next;
+}
+
 export default function Home() {
   // --- Auth state ---
   const { user, isLoading: authLoading, isAuthenticated, login, logout } = useAuth();
@@ -36,6 +45,8 @@ export default function Home() {
   // --- Chat state ---
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [loading, setLoading] = useState(false);
+  // Set when the last send failed in a way that is worth replaying
+  const [retryPrompt, setRetryPrompt] = useState<string | null>(null);
 
   // --- UI state ---
   const [mobileView, setMobileView] = useState<MobileView>("chat");
@@ -83,29 +94,42 @@ export default function Home() {
 
   // --- Send message to AI ---
   const handleSend = useCallback(
-    async (content: string) => {
+    async (content: string, options?: { retry?: boolean }) => {
+      const isRetry = options?.retry === true;
       const currentMessages = messagesRef.current;
       const currentTasks = tasksRef.current;
-      const userMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: "user",
-        content,
-        timestamp: new Date().toISOString(),
-      };
 
-      const newMessages = [...currentMessages, userMessage];
-      setMessages(newMessages);
+      // On retry, drop the trailing failure notice and reuse the existing user
+      // turn instead of appending a duplicate bubble.
+      const base = isRetry
+        ? dropTrailingErrors(currentMessages)
+        : currentMessages;
+      const outbound: ChatMessage[] = isRetry
+        ? base
+        : [
+            ...base,
+            {
+              id: crypto.randomUUID(),
+              role: "user",
+              content,
+              timestamp: new Date().toISOString(),
+            },
+          ];
+
+      setMessages(outbound);
       setLoading(true);
+
+      let canRetry = true;
 
       try {
         const response = await fetch("/api/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            messages: newMessages.map((m) => ({
-              role: m.role,
-              content: m.content,
-            })),
+            // Failure notices are UI-only — never send them to the model.
+            messages: outbound
+              .filter((m) => !m.isError)
+              .map((m) => ({ role: m.role, content: m.content })),
             // Send current tasks so the server can provide context + execute tool calls
             tasks: currentTasks,
             // Send browser timezone so the AI understands the user's local time
@@ -114,8 +138,13 @@ export default function Home() {
         });
 
         if (!response.ok) {
-          const errorData = await response.json();
-          throw new Error(errorData.error || "请求失败");
+          const errorData = await response.json().catch(() => ({}));
+          if (errorData.retryable === false) canRetry = false;
+          throw new Error(
+            typeof errorData.error === "string" && errorData.error
+              ? errorData.error
+              : "请求失败"
+          );
         }
 
         const data = await response.json();
@@ -128,27 +157,41 @@ export default function Home() {
         };
 
         setMessages((prev) => [...prev, assistantMessage]);
+        setRetryPrompt(null);
 
         // Update localStorage with the server-returned task list
         if (data.tasks) {
           replaceAllTasks(data.tasks);
-          toast("AI 已更新任务列表", "success");
+          toast(
+            data.degraded
+              ? "AI 回复生成失败，已直接展示实际操作结果"
+              : "AI 已更新任务列表",
+            data.degraded ? "warning" : "success"
+          );
         }
       } catch (error) {
+        // Surface the real reason (timeout / rate limit / bad key) instead of
+        // pointing the user at the API key every single time.
+        const reason =
+          error instanceof Error && error.message
+            ? error.message
+            : "网络似乎不通，检查一下连接再试一次。";
+
         const errorMessage: ChatMessage = {
           id: crypto.randomUUID(),
           role: "assistant",
-          content:
-            "抱歉，出了点问题 😅 请检查 API Key 是否正确配置，然后重试。",
+          content: `😅 ${reason}`,
           timestamp: new Date().toISOString(),
+          isError: true,
         };
         setMessages((prev) => [...prev, errorMessage]);
-        toast("AI 响应失败，请检查 API 配置", "error");
+        setRetryPrompt(canRetry ? content : null);
+        toast(reason, "error");
       } finally {
         setLoading(false);
       }
     },
-    [replaceAllTasks, tasksRef]
+    [replaceAllTasks, tasksRef, toast]
   );
 
   // --- Direct task actions (localStorage, no server round-trip) ---
@@ -288,6 +331,12 @@ export default function Home() {
             messages={messages}
             loading={loading}
             onSend={handleSend}
+            retryPrompt={retryPrompt}
+            onRetry={() => {
+              if (retryPrompt) {
+                void handleSend(retryPrompt, { retry: true });
+              }
+            }}
           />
         </div>
 

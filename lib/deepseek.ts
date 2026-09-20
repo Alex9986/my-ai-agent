@@ -24,7 +24,7 @@ interface DeepSeekTool {
 }
 
 interface DeepSeekResponse {
-  choices: {
+  choices?: {
     message: {
       role: string;
       content: string | null;
@@ -35,6 +35,172 @@ interface DeepSeekResponse {
 }
 
 const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
+const MODEL = "deepseek-chat";
+
+/** DeepSeek usually answers in 1–3s. Past this we treat the request as stuck. */
+const REQUEST_TIMEOUT_MS = 20_000;
+/** 1 initial attempt + 2 retries. */
+const MAX_ATTEMPTS = 3;
+/** Base delay for exponential backoff (600ms, then 1200ms). */
+const RETRY_BASE_DELAY_MS = 600;
+
+export type DeepSeekErrorKind =
+  /** Server is missing DEEPSEEK_API_KEY — retrying can never help. */
+  | "config"
+  /** 4xx other than 429 (bad key, no balance, request rejected). */
+  | "client"
+  /** 429 — we are being throttled. */
+  | "rate_limit"
+  /** 5xx — DeepSeek had a bad moment. */
+  | "server"
+  /** Our own deadline fired. */
+  | "timeout"
+  /** DNS / TLS / connection reset. */
+  | "network";
+
+export class DeepSeekError extends Error {
+  readonly kind: DeepSeekErrorKind;
+  readonly status?: number;
+
+  constructor(message: string, kind: DeepSeekErrorKind, status?: number) {
+    super(message);
+    this.name = "DeepSeekError";
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+const RETRYABLE_KINDS: DeepSeekErrorKind[] = [
+  "rate_limit",
+  "server",
+  "timeout",
+  "network",
+];
+
+export function isRetryableKind(kind: DeepSeekErrorKind): boolean {
+  return RETRYABLE_KINDS.includes(kind);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Exponential backoff with jitter. Honours `Retry-After` when DeepSeek sends
+ * one, as long as it is a sane value (we never wait longer than 10s).
+ */
+function backoffDelay(attempt: number, retryAfterSeconds?: number): number {
+  if (
+    typeof retryAfterSeconds === "number" &&
+    Number.isFinite(retryAfterSeconds) &&
+    retryAfterSeconds > 0 &&
+    retryAfterSeconds <= 10
+  ) {
+    return Math.round(retryAfterSeconds * 1000);
+  }
+  const base = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+  return Math.round(base + Math.random() * 250);
+}
+
+function classifyStatus(status: number): DeepSeekErrorKind {
+  if (status === 429) return "rate_limit";
+  if (status >= 500) return "server";
+  return "client";
+}
+
+function truncate(text: string, max = 300): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max)}…` : trimmed;
+}
+
+/**
+ * POST to the chat-completions endpoint with a hard deadline and bounded
+ * retries. Only transient failures (timeout / network / 429 / 5xx) are
+ * retried — a bad API key or a rejected payload fails fast.
+ */
+async function postChatCompletion(
+  body: Record<string, unknown>
+): Promise<DeepSeekResponse> {
+  const apiKey = process.env.DEEPSEEK_API_KEY;
+  if (!apiKey) {
+    throw new DeepSeekError("环境变量 DEEPSEEK_API_KEY 未配置", "config");
+  }
+
+  let lastError: DeepSeekError | null = null;
+
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    let response: Response;
+
+    try {
+      response = await fetch(DEEPSEEK_API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      const interrupted =
+        error instanceof DOMException &&
+        (error.name === "TimeoutError" || error.name === "AbortError");
+
+      lastError = interrupted
+        ? new DeepSeekError(
+            `DeepSeek 请求超时（${REQUEST_TIMEOUT_MS}ms）`,
+            "timeout"
+          )
+        : new DeepSeekError(
+            `无法连接 DeepSeek：${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            "network"
+          );
+
+      if (attempt < MAX_ATTEMPTS) {
+        await sleep(backoffDelay(attempt));
+        continue;
+      }
+      break;
+    }
+
+    if (response.ok) {
+      try {
+        return (await response.json()) as DeepSeekResponse;
+      } catch {
+        lastError = new DeepSeekError("DeepSeek 返回的不是合法 JSON", "server");
+        if (attempt < MAX_ATTEMPTS) {
+          await sleep(backoffDelay(attempt));
+          continue;
+        }
+        break;
+      }
+    }
+
+    const errorText = await response.text().catch(() => "");
+    const kind = classifyStatus(response.status);
+    lastError = new DeepSeekError(
+      `DeepSeek API ${response.status}: ${truncate(errorText)}`,
+      kind,
+      response.status
+    );
+
+    if (attempt < MAX_ATTEMPTS && isRetryableKind(kind)) {
+      const retryAfterHeader = response.headers.get("retry-after");
+      await sleep(
+        backoffDelay(
+          attempt,
+          retryAfterHeader == null ? undefined : Number(retryAfterHeader)
+        )
+      );
+      continue;
+    }
+    break;
+  }
+
+  throw lastError ?? new DeepSeekError("DeepSeek 调用失败（未知原因）", "network");
+}
 
 function buildSystemPrompt(timezone: string): string {
   const now = new Date().toLocaleString("zh-CN", { timeZone: timezone });
@@ -211,130 +377,160 @@ const TOOLS: DeepSeekTool[] = [
   },
 ];
 
-export interface DeepSeekCallResult {
-  message: string;
-  toolCalls: Array<{
-    name: string;
-    arguments: Record<string, unknown>;
-  }>;
+/** One tool call the model asked for, with arguments already parsed. */
+export interface ToolInvocation {
+  id: string;
+  name: string;
+  args: Record<string, unknown>;
+  /** Set when the model emitted arguments that are not a valid JSON object. */
+  argumentsError?: string;
 }
 
-export async function callDeepSeek(
+/**
+ * Everything needed to ask the model for the wording of an answer, *after*
+ * the tool calls have actually been executed.
+ */
+export interface Continuation {
+  /** The exact message array used for the intent call (system prompt + history). */
+  prefixMessages: DeepSeekMessage[];
+  /** The assistant turn carrying tool_calls — ids must be echoed back verbatim. */
+  assistantMessage: DeepSeekMessage;
+}
+
+export interface IntentResult {
+  /** Direct answer — set only when the model chose not to touch any tool. */
+  message: string | null;
+  toolCalls: ToolInvocation[];
+  /** Non-null when the model asked for tools. Pass to generateReply(). */
+  continuation: Continuation | null;
+}
+
+function buildChatMessages(
   messages: { role: string; content: string }[],
   currentTasks: Record<string, unknown>[],
   timezone: string
-): Promise<DeepSeekCallResult> {
-  const apiKey = process.env.DEEPSEEK_API_KEY;
-  if (!apiKey) {
-    throw new Error("DEEPSEEK_API_KEY is not set in environment variables");
-  }
-
-  // Build task context for the system prompt
+): DeepSeekMessage[] {
   const taskContext =
     currentTasks.length > 0
       ? `\n\n当前用户的任务列表（JSON格式，供你参考）：\n${JSON.stringify(currentTasks, null, 2)}\n\n当用户提到"这个任务"、"刚才那个"等模糊指代时，请根据对话上下文和这个任务列表来判断具体是哪个任务。`
       : "\n\n用户当前没有任何任务。";
 
-  const systemPrompt = buildSystemPrompt(timezone);
-
-  const chatMessages: DeepSeekMessage[] = [
-    { role: "system", content: systemPrompt + taskContext },
+  return [
+    { role: "system", content: buildSystemPrompt(timezone) + taskContext },
     ...messages.map((m) => ({
       role: m.role as DeepSeekMessage["role"],
       content: m.content,
     })),
   ];
+}
 
-  // First call - may return tool_calls
-  const response = await fetch(DEEPSEEK_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: JSON.stringify({
-      model: "deepseek-chat",
-      messages: chatMessages,
-      tools: TOOLS,
-      tool_choice: "auto",
-      temperature: 0.7,
-      max_tokens: 2048,
-    }),
+/**
+ * Parses the `arguments` string the model produced. A malformed payload must
+ * not blow up the whole request — it is reported back as `argumentsError`
+ * so the caller can skip that single tool call.
+ */
+function parseArguments(
+  raw: string
+): { args: Record<string, unknown> } | { error: string } {
+  if (!raw || !raw.trim()) return { args: {} };
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return { args: parsed as Record<string, unknown> };
+    }
+    return { error: "参数不是一个 JSON 对象" };
+  } catch (error) {
+    return {
+      error: error instanceof Error ? error.message : "参数不是合法 JSON",
+    };
+  }
+}
+
+/**
+ * Round 1 — ask the model what it wants to do.
+ * Nothing in the task list has been modified when this returns.
+ */
+export async function requestIntent(
+  messages: { role: string; content: string }[],
+  currentTasks: Record<string, unknown>[],
+  timezone: string
+): Promise<IntentResult> {
+  const prefixMessages = buildChatMessages(messages, currentTasks, timezone);
+
+  const data = await postChatCompletion({
+    model: MODEL,
+    messages: prefixMessages,
+    tools: TOOLS,
+    tool_choice: "auto",
+    temperature: 0.7,
+    max_tokens: 2048,
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`DeepSeek API error: ${response.status} ${errorText}`);
+  const message = data.choices?.[0]?.message;
+  if (!message) {
+    throw new DeepSeekError("DeepSeek 没有返回任何候选结果", "server");
   }
 
-  const data: DeepSeekResponse = await response.json();
-  const choice = data.choices[0];
-  const message = choice.message;
+  const rawToolCalls = message.tool_calls ?? [];
 
-  // If the model wants to call tools
-  if (message.tool_calls && message.tool_calls.length > 0) {
-    const toolCalls = message.tool_calls.map((tc) => ({
-      name: tc.function.name,
-      arguments: JSON.parse(tc.function.arguments),
-    }));
-
-    // For the second call, we need to ask DeepSeek to generate a final response
-    // after the tool calls are executed (handled by the caller)
-    // We return the tool calls so the caller can execute and then call again
-    const toolResults = toolCalls.map((tc) => ({
-      name: tc.name,
-      arguments: tc.arguments,
-    }));
-
-    // Make the follow-up call to get the final message
-    const followUpMessages: DeepSeekMessage[] = [
-      ...chatMessages,
-      {
-        role: "assistant",
-        content: message.content || "",
-        tool_calls: message.tool_calls,
-      },
-      ...message.tool_calls.map((tc) => ({
-        role: "tool" as const,
-        tool_call_id: tc.id,
-        content: JSON.stringify({ success: true }),
-      })),
-    ];
-
-    const followUpResponse = await fetch(DEEPSEEK_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model: "deepseek-chat",
-        messages: followUpMessages,
-        temperature: 0.7,
-        max_tokens: 1024,
-      }),
-    });
-
-    if (!followUpResponse.ok) {
-      // If follow-up fails, return a default message
-      return {
-        message: "好的，已经处理完成！✅",
-        toolCalls: toolResults,
-      };
-    }
-
-    const followUpData: DeepSeekResponse = await followUpResponse.json();
-    const finalContent = followUpData.choices[0]?.message?.content || "好的，已经处理完成！✅";
-
+  if (rawToolCalls.length === 0) {
     return {
-      message: finalContent,
-      toolCalls: toolResults,
+      message: message.content?.trim() || "嗯，我理解了。有什么我可以帮你的吗？",
+      toolCalls: [],
+      continuation: null,
     };
   }
 
-  // No tool calls - just a text response
+  const toolCalls: ToolInvocation[] = rawToolCalls.map((call) => {
+    const parsed = parseArguments(call.function.arguments);
+    if ("error" in parsed) {
+      return {
+        id: call.id,
+        name: call.function.name,
+        args: {},
+        argumentsError: parsed.error,
+      };
+    }
+    return { id: call.id, name: call.function.name, args: parsed.args };
+  });
+
   return {
-    message: message.content || "嗯，我理解了。有什么我可以帮你的吗？",
-    toolCalls: [],
+    message: null,
+    toolCalls,
+    continuation: {
+      prefixMessages,
+      assistantMessage: {
+        role: "assistant",
+        content: message.content ?? "",
+        tool_calls: rawToolCalls,
+      },
+    },
   };
+}
+
+/**
+ * Round 2 — hand the *real* execution results back to the model and ask it to
+ * phrase the outcome. Returns null when the model produced no usable text;
+ * throws DeepSeekError when the call itself failed.
+ */
+export async function generateReply(
+  continuation: Continuation,
+  toolResults: { toolCallId: string; content: string }[]
+): Promise<string | null> {
+  const data = await postChatCompletion({
+    model: MODEL,
+    messages: [
+      ...continuation.prefixMessages,
+      continuation.assistantMessage,
+      ...toolResults.map((result) => ({
+        role: "tool" as const,
+        tool_call_id: result.toolCallId,
+        content: result.content,
+      })),
+    ],
+    temperature: 0.7,
+    max_tokens: 1024,
+  });
+
+  return data.choices?.[0]?.message?.content?.trim() || null;
 }

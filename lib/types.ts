@@ -15,6 +15,8 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
   timestamp: string;
+  /** True for locally-generated failure notices — never sent back to the model. */
+  isError?: boolean;
 }
 
 export interface ChatRequest {
@@ -26,6 +28,8 @@ export interface ChatRequest {
 export interface ChatResponse {
   message: string;
   tasks: Task[];
+  /** True when the AI wording was unavailable and a local result summary was used. */
+  degraded?: boolean;
 }
 
 export type TaskFilter = "all" | "pending" | "in_progress" | "completed";

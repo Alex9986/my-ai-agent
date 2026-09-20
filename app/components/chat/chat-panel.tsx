@@ -1,7 +1,7 @@
 "use client";
 
 import { useRef, useEffect } from "react";
-import { MessageCircle, Sparkles } from "lucide-react";
+import { MessageCircle, Sparkles, RotateCcw } from "lucide-react";
 import ChatMessage from "./chat-message";
 import ChatInput from "./chat-input";
 import TypingIndicator from "./typing-indicator";
@@ -11,12 +11,17 @@ interface ChatPanelProps {
   messages: ChatMessageType[];
   loading: boolean;
   onSend: (message: string) => void;
+  /** Last prompt worth replaying — shows a retry affordance when set. */
+  retryPrompt?: string | null;
+  onRetry?: () => void;
 }
 
 export default function ChatPanel({
   messages,
   loading,
   onSend,
+  retryPrompt,
+  onRetry,
 }: ChatPanelProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -90,6 +95,19 @@ export default function ChatPanel({
           {loading && <TypingIndicator />}
         </div>
       </div>
+
+      {/* Retry bar — only offered when replaying the request could actually help */}
+      {retryPrompt && !loading && onRetry && (
+        <div className="flex-shrink-0 px-4 pb-2">
+          <button
+            onClick={onRetry}
+            className="w-full flex items-center justify-center gap-1.5 rounded-lg border border-amber-300 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 px-3 py-2 text-xs text-amber-700 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            重试上一条消息
+          </button>
+        </div>
+      )}
 
       {/* Input */}
       <ChatInput onSend={onSend} disabled={loading} />

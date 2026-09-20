@@ -53,6 +53,47 @@ export function completeTaskInList(
 }
 
 /**
+ * Pure function — what actually happened to one tool call.
+ * `ok` = applied, everything else = skipped for a reason worth telling the user.
+ */
+export type ToolOutcome = "ok" | "not_found" | "invalid" | "unknown_tool";
+
+export interface ToolExecutionRecord {
+  /** Tool name the model asked for. */
+  name: string;
+  outcome: ToolOutcome;
+  /** One-line, user-facing description of what really happened. */
+  detail: string;
+}
+
+/**
+ * Deterministic summary of the executed tool calls.
+ *
+ * Used as the reply text when the model's follow-up call is unavailable
+ * (timeout, retries exhausted, empty completion). The point is honesty: the
+ * user sees what the server actually did, not a canned "已经处理完成".
+ */
+export function buildFallbackMessage(records: ToolExecutionRecord[]): string {
+  if (records.length === 0) {
+    return "AI 这会儿没能回复上来，请稍后再试一次。";
+  }
+
+  const done = records.filter((r) => r.outcome === "ok");
+  const skipped = records.filter((r) => r.outcome !== "ok");
+
+  const lines: string[] = ["AI 的回复没能生成出来，不过操作已经实际执行了："];
+
+  if (done.length > 0) {
+    lines.push("", ...done.map((r) => `✅ ${r.detail}`));
+  }
+  if (skipped.length > 0) {
+    lines.push("", ...skipped.map((r) => `⚠️ ${r.detail}`));
+  }
+
+  return lines.join("\n");
+}
+
+/**
  * Pure function — search/filter tasks.
  */
 export function findTasksInList(
