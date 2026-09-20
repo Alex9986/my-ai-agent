@@ -2,8 +2,11 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { Task } from "@/lib/types";
-
-const STORAGE_KEY = "ai-todo-tasks";
+import {
+  evaluateTaskSync,
+  storageKeyFor,
+  type TaskOrigin,
+} from "@/lib/task-cache";
 
 const SAMPLE_TASKS: Task[] = [
   {
@@ -40,9 +43,9 @@ const SAMPLE_TASKS: Task[] = [
   },
 ];
 
-function loadFromStorage(): Task[] | null {
+function loadFromStorage(username: string): Task[] | null {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = localStorage.getItem(storageKeyFor(username));
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return null;
@@ -52,9 +55,9 @@ function loadFromStorage(): Task[] | null {
   }
 }
 
-function saveToStorage(tasks: Task[]): void {
+function saveToStorage(username: string, tasks: Task[]): void {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(tasks));
+    localStorage.setItem(storageKeyFor(username), JSON.stringify(tasks));
   } catch {
     // localStorage full or unavailable — silently ignore
   }
@@ -66,12 +69,31 @@ export function useTasks(username: string | null) {
   const tasksRef = useRef(tasks);
   tasksRef.current = tasks;
 
+  /** Which user the tasks currently in state belong to. */
+  const dataOwnerRef = useRef<string | null>(null);
+  /** How those tasks were obtained. */
+  const dataOriginRef = useRef<TaskOrigin | null>(null);
+  /** The exact array the loader handed to setTasks — lets the sync effect tell
+   *  "unchanged since load" apart from "the user actually edited something". */
+  const loadedSnapshotRef = useRef<Task[] | null>(null);
+
   // --- Load tasks from server (with localStorage fallback) on username change ---
   useEffect(() => {
     let cancelled = false;
 
+    function apply(next: Task[], owner: string, origin: TaskOrigin): void {
+      dataOwnerRef.current = owner;
+      dataOriginRef.current = origin;
+      loadedSnapshotRef.current = next;
+      setTasks(next);
+      setReady(true);
+    }
+
     async function load() {
       if (!username) {
+        dataOwnerRef.current = null;
+        dataOriginRef.current = null;
+        loadedSnapshotRef.current = null;
         setTasks([]);
         setReady(false);
         return;
@@ -88,8 +110,7 @@ export function useTasks(username: string | null) {
           const data = await res.json();
           if (!cancelled && Array.isArray(data.tasks)) {
             // Server has data (including empty array) — use it as-is
-            setTasks(data.tasks);
-            setReady(true);
+            apply(data.tasks, username, "server");
             return;
           }
         }
@@ -101,18 +122,16 @@ export function useTasks(username: string | null) {
 
       if (cancelled) return;
 
-      // Priority 2: localStorage cache (only used when server is unreachable)
-      const local = loadFromStorage();
+      // Priority 2: this user's own cache (only when the server is unreachable)
+      const local = loadFromStorage(username);
       if (local && local.length > 0) {
-        setTasks(local);
-        setReady(true);
+        apply(local, username, "cache");
         return;
       }
 
-      // Priority 3: Seed sample tasks
+      // Priority 3: Seed sample tasks — demo content, never published back
       if (!cancelled) {
-        setTasks(SAMPLE_TASKS);
-        setReady(true);
+        apply(SAMPLE_TASKS, username, "sample");
       }
     }
 
@@ -121,18 +140,27 @@ export function useTasks(username: string | null) {
   }, [username]);
 
   // --- Sync tasks to localStorage + server on every change ---
-  const isInitialLoad = useRef(true);
   useEffect(() => {
-    // Skip the initial load (first state set from the load effect above)
-    if (isInitialLoad.current) {
-      isInitialLoad.current = false;
+    const skipReason = evaluateTaskSync({
+      username,
+      ready,
+      dataOwner: dataOwnerRef.current,
+      dataOrigin: dataOriginRef.current,
+      unchangedSinceLoad: tasks === loadedSnapshotRef.current,
+    });
+
+    if (skipReason) {
+      if (skipReason === "sample-data") {
+        console.warn("Tasks are the sample seed — skipping server sync.");
+      }
       return;
     }
 
-    if (!username || !ready) return;
+    // Non-null from here on — evaluateTaskSync returns "no-user" otherwise.
+    if (!username) return;
 
-    // Cache to localStorage
-    saveToStorage(tasks);
+    // Cache into this user's own slot
+    saveToStorage(username, tasks);
 
     // Fire-and-forget sync to server
     fetch("/api/tasks", {
