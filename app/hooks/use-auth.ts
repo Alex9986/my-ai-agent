@@ -1,32 +1,23 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import {
+  AuthState,
+  StorageLike,
+  clearAuthState,
+  restoreSession,
+  writeAuthState,
+} from "@/lib/auth-session";
 
-interface AuthState {
-  username: string;
-}
-
-const AUTH_STORAGE_KEY = "ai-todo-auth";
-
-function loadFromStorage(): AuthState | null {
+/**
+ * Touching window.localStorage / window.sessionStorage can throw outright when
+ * the browser blocks site data, so both lookups are guarded.
+ */
+function getStorage(kind: "session" | "local"): StorageLike | null {
   try {
-    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed.username !== "string" || !parsed.username) {
-      return null;
-    }
-    return { username: parsed.username };
+    return kind === "session" ? window.sessionStorage : window.localStorage;
   } catch {
     return null;
-  }
-}
-
-function saveToStorage(state: AuthState): void {
-  try {
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(state));
-  } catch {
-    // localStorage full or unavailable — silently ignore
   }
 }
 
@@ -34,33 +25,18 @@ export function useAuth() {
   const [user, setUser] = useState<AuthState | null>(null);
   const [isLoading, setIsLoading] = useState(true);
 
-  // Load auth state from localStorage on mount
+  // --- Restore the session for this tab only ---
+  // The session lives in sessionStorage, so a freshly opened tab or a browser
+  // that was just started finds nothing here and lands on the login screen.
+  // Any session left behind in localStorage by an older build is purged.
   useEffect(() => {
-    const stored = loadFromStorage();
+    const session = getStorage("session");
+    const legacy = getStorage("local");
+    const stored = restoreSession(session, legacy);
     if (stored) {
       setUser(stored);
     }
     setIsLoading(false);
-  }, []);
-
-  // Listen for storage changes from other tabs
-  useEffect(() => {
-    function handleStorageChange(e: StorageEvent) {
-      if (e.key === AUTH_STORAGE_KEY) {
-        if (e.newValue === null) {
-          // Auth was removed in another tab — sync logout
-          setUser(null);
-        } else {
-          const stored = loadFromStorage();
-          if (stored) {
-            setUser(stored);
-          }
-        }
-      }
-    }
-
-    window.addEventListener("storage", handleStorageChange);
-    return () => window.removeEventListener("storage", handleStorageChange);
   }, []);
 
   const login = useCallback(async (username: string, password: string) => {
@@ -85,15 +61,19 @@ export function useAuth() {
 
     const authState: AuthState = { username: data.username };
     setUser(authState);
-    saveToStorage(authState);
+
+    const session = getStorage("session");
+    if (session) {
+      writeAuthState(session, authState);
+    }
   }, []);
 
   const logout = useCallback(() => {
     setUser(null);
-    try {
-      localStorage.removeItem(AUTH_STORAGE_KEY);
-    } catch {
-      // silently ignore
+
+    const session = getStorage("session");
+    if (session) {
+      clearAuthState(session);
     }
   }, []);
 
