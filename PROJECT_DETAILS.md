@@ -22,7 +22,7 @@
 | 样式 | Tailwind CSS + shadcn/ui | 4.x |
 | 动画 | Framer Motion | 12.x |
 | 图标 | Lucide React | 1.17 |
-| AI 模型 | DeepSeek (deepseek-chat) | Function Calling API |
+| AI 模型 | DeepSeek (deepseek-flash) | Function Calling API |
 | 云数据库 | 腾讯 CloudBase (HTTP API) | — |
 | 构建工具 | Turbopack (dev) | — |
 

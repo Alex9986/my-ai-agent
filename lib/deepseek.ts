@@ -35,7 +35,22 @@ interface DeepSeekResponse {
 }
 
 const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
-const MODEL = "deepseek-chat";
+
+/**
+ * `deepseek-chat` / `deepseek-reasoner` were retired on 2026-07-24 and now fail
+ * outright, so the name lives in one place and can be overridden without a code
+ * change the next time DeepSeek rotates its lineup.
+ */
+const MODEL = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-flash";
+
+/**
+ * Thinking mode is enabled by default on V4 and silently ignores `temperature`
+ * (and `presence_penalty` / `frequency_penalty`). This app is a bounded
+ * two-round tool loop — chain-of-thought buys nothing here, costs latency and
+ * output tokens, and drags in the `reasoning_content` round-trip requirement
+ * that a tool-carrying request must satisfy. Non-thinking it is.
+ */
+const NON_THINKING_MODE = { thinking: { type: "disabled" as const } };
 
 /** DeepSeek usually answers in 1–3s. Past this we treat the request as stuck. */
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -462,6 +477,7 @@ export async function requestIntent(
     messages: prefixMessages,
     tools: TOOLS,
     tool_choice: "auto",
+    ...NON_THINKING_MODE,
     temperature: 0.7,
     max_tokens: 2048,
   });
@@ -528,6 +544,7 @@ export async function generateReply(
         content: result.content,
       })),
     ],
+    ...NON_THINKING_MODE,
     temperature: 0.7,
     max_tokens: 1024,
   });

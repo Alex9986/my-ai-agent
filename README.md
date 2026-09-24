@@ -22,7 +22,7 @@
 | 语言 | TypeScript |
 | UI | React 19 + Tailwind CSS 4 + shadcn/ui |
 | 动画 | Framer Motion |
-| AI 模型 | DeepSeek (deepseek-chat, Function Calling API) |
+| AI 模型 | DeepSeek (deepseek-flash, Function Calling API) |
 | 云数据库 | 腾讯 CloudBase (HTTP API，无 SDK) |
 
 ## 项目结构
