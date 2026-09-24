@@ -1,3 +1,5 @@
+import type { StopReason } from "@/lib/types";
+
 interface DeepSeekMessage {
   role: "system" | "user" | "assistant" | "tool";
   content: string;
@@ -23,6 +25,15 @@ interface DeepSeekTool {
   };
 }
 
+/** Token accounting, including how much of the prompt hit DeepSeek's cache. */
+export interface DeepSeekUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+}
+
 interface DeepSeekResponse {
   choices?: {
     message: {
@@ -32,6 +43,7 @@ interface DeepSeekResponse {
     };
     finish_reason: string;
   }[];
+  usage?: DeepSeekUsage;
 }
 
 const DEEPSEEK_API_URL = "https://api.deepseek.com/v1/chat/completions";
@@ -45,12 +57,45 @@ const MODEL = process.env.DEEPSEEK_MODEL?.trim() || "deepseek-flash";
 
 /**
  * Thinking mode is enabled by default on V4 and silently ignores `temperature`
- * (and `presence_penalty` / `frequency_penalty`). This app is a bounded
- * two-round tool loop — chain-of-thought buys nothing here, costs latency and
- * output tokens, and drags in the `reasoning_content` round-trip requirement
- * that a tool-carrying request must satisfy. Non-thinking it is.
+ * (and `presence_penalty` / `frequency_penalty`). This app runs a bounded tool
+ * loop — chain-of-thought buys nothing here, costs latency and output tokens,
+ * and drags in the `reasoning_content` round-trip requirement that a
+ * tool-carrying request must satisfy. Non-thinking it is.
  */
 const NON_THINKING_MODE = { thinking: { type: "disabled" as const } };
+
+/** Reads a positive integer env var, falling back when unset or nonsense. */
+function envInt(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+/**
+ * Ceiling on model round-trips per user turn. Each step is a full request
+ * carrying the whole conversation, so this is the main cost dial.
+ */
+const MAX_STEPS = envInt("AGENT_MAX_STEPS", 5);
+
+/**
+ * Deadline for the whole turn, not one HTTP call.
+ *
+ * `REQUEST_TIMEOUT_MS` bounds a single request; without this, five steps could
+ * legitimately take 100s. Must stay under the hosting platform's function
+ * timeout — on Vercel's 10s default this needs to drop to ~8s, which is worth
+ * knowing before enabling multi-step behaviour there.
+ */
+const TOTAL_BUDGET_MS = envInt("AGENT_TOTAL_BUDGET_MS", 45_000);
+
+/**
+ * How many history messages survive into the prompt. Older turns fall off the
+ * front; the task list below carries the durable state anyway.
+ */
+const MAX_HISTORY_MESSAGES = envInt("AGENT_MAX_HISTORY", 20);
+
+/** Consecutive identical tool-call batches that mean the model is stuck. */
+const NO_PROGRESS_LIMIT = 2;
 
 /** DeepSeek usually answers in 1–3s. Past this we treat the request as stuck. */
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -239,10 +284,22 @@ function buildSystemPrompt(timezone: string): string {
 - 当用户说"第一个"、"倒数第二个"、"最后一个"等位置时，请根据这个排序后的 index 来判断
 - 例如："倒数第二个任务"指的是列表中 index 为 N-1 的那个任务（N 为任务总数）
 
+工作方式：
+- 你可以连续调用工具：先调用一部分，看到执行结果后，再决定要不要继续调用
+- 需要依赖上一步结果的任务（例如"添加一个任务并把它标记完成"）要分步做：
+  先调用 add_task，从返回结果里拿到新任务的 id，再调用 complete_task
+- 如果一次调用就能做完，直接做即可，不要为了分步而分步
+- 当你认为用户的请求已经全部完成时，不要再调用任何工具，直接用自然语言总结
+
+诚实要求：
+- 工具返回里带 "success": false 表示这一步实际没有成功（例如没找到任务、参数不合法）
+- 这种情况下必须如实告诉用户哪一步没做成，绝对不要声称已经完成
+- 只有返回 "success": true 的才是真的执行了
+
 回复风格：
 - 使用中文回复
 - 友好、热情，适当使用表情符号
-- 每次操作后简要确认做了什么
+- 在所有操作都结束后，统一简要说明你做了什么
 - 如果用户只是聊天，就友好地聊天
 - 如果用户的问题不涉及任务操作，直接回答即可
 
@@ -402,22 +459,36 @@ export interface ToolInvocation {
 }
 
 /**
- * Everything needed to ask the model for the wording of an answer, *after*
- * the tool calls have actually been executed.
+ * Renders the task list for the system prompt.
+ *
+ * Two deliberate savings over dumping a pretty-printed blob of every field:
+ * the model only needs enough to resolve "第一个" / "倒数第二个" and to pick an
+ * id, and one compact JSON object per line costs a fraction of a 2-space
+ * indented tree. `description` is left out entirely — it is the only unbounded
+ * field, and `list_tasks` can search it when a request actually needs it.
  */
-export interface Continuation {
-  /** The exact message array used for the intent call (system prompt + history). */
-  prefixMessages: DeepSeekMessage[];
-  /** The assistant turn carrying tool_calls — ids must be echoed back verbatim. */
-  assistantMessage: DeepSeekMessage;
+function renderTaskContext(tasks: Record<string, unknown>[]): string {
+  if (tasks.length === 0) return "\n\n用户当前没有任何任务。";
+
+  const lines = tasks.map((task) => JSON.stringify(task)).join("\n");
+
+  return `\n\n当前用户的任务列表（每行一个任务，index 是它在界面上的位置，从 1 开始）：\n${lines}\n\n当用户提到"这个任务"、"刚才那个"等模糊指代时，请根据对话上下文和这个任务列表来判断具体是哪个任务。`;
 }
 
-export interface IntentResult {
-  /** Direct answer — set only when the model chose not to touch any tool. */
-  message: string | null;
-  toolCalls: ToolInvocation[];
-  /** Non-null when the model asked for tools. Pass to generateReply(). */
-  continuation: Continuation | null;
+/**
+ * Keeps only the newest turns. The window never starts on a `tool` message,
+ * which would otherwise be an orphan without the assistant turn that asked
+ * for it.
+ */
+function applyHistoryWindow(
+  messages: { role: string; content: string }[]
+): { role: string; content: string }[] {
+  if (messages.length <= MAX_HISTORY_MESSAGES) return messages;
+
+  const window = messages.slice(-MAX_HISTORY_MESSAGES);
+  let start = 0;
+  while (start < window.length && window[start].role === "tool") start += 1;
+  return window.slice(start);
 }
 
 function buildChatMessages(
@@ -425,14 +496,11 @@ function buildChatMessages(
   currentTasks: Record<string, unknown>[],
   timezone: string
 ): DeepSeekMessage[] {
-  const taskContext =
-    currentTasks.length > 0
-      ? `\n\n当前用户的任务列表（JSON格式，供你参考）：\n${JSON.stringify(currentTasks, null, 2)}\n\n当用户提到"这个任务"、"刚才那个"等模糊指代时，请根据对话上下文和这个任务列表来判断具体是哪个任务。`
-      : "\n\n用户当前没有任何任务。";
+  const taskContext = renderTaskContext(currentTasks);
 
   return [
     { role: "system", content: buildSystemPrompt(timezone) + taskContext },
-    ...messages.map((m) => ({
+    ...applyHistoryWindow(messages).map((m) => ({
       role: m.role as DeepSeekMessage["role"],
       content: m.content,
     })),
@@ -461,93 +529,140 @@ function parseArguments(
   }
 }
 
-/**
- * Round 1 — ask the model what it wants to do.
- * Nothing in the task list has been modified when this returns.
- */
-export async function requestIntent(
-  messages: { role: string; content: string }[],
-  currentTasks: Record<string, unknown>[],
-  timezone: string
-): Promise<IntentResult> {
-  const prefixMessages = buildChatMessages(messages, currentTasks, timezone);
-
-  const data = await postChatCompletion({
-    model: MODEL,
-    messages: prefixMessages,
-    tools: TOOLS,
-    tool_choice: "auto",
-    ...NON_THINKING_MODE,
-    temperature: 0.7,
-    max_tokens: 2048,
-  });
-
-  const message = data.choices?.[0]?.message;
-  if (!message) {
-    throw new DeepSeekError("DeepSeek 没有返回任何候选结果", "server");
-  }
-
-  const rawToolCalls = message.tool_calls ?? [];
-
-  if (rawToolCalls.length === 0) {
+/** Parses one raw tool call, surviving arguments the model mangled. */
+function toInvocation(call: DeepSeekToolCall): ToolInvocation {
+  const parsed = parseArguments(call.function.arguments);
+  if ("error" in parsed) {
     return {
-      message: message.content?.trim() || "嗯，我理解了。有什么我可以帮你的吗？",
-      toolCalls: [],
-      continuation: null,
+      id: call.id,
+      name: call.function.name,
+      args: {},
+      argumentsError: parsed.error,
     };
   }
-
-  const toolCalls: ToolInvocation[] = rawToolCalls.map((call) => {
-    const parsed = parseArguments(call.function.arguments);
-    if ("error" in parsed) {
-      return {
-        id: call.id,
-        name: call.function.name,
-        args: {},
-        argumentsError: parsed.error,
-      };
-    }
-    return { id: call.id, name: call.function.name, args: parsed.args };
-  });
-
-  return {
-    message: null,
-    toolCalls,
-    continuation: {
-      prefixMessages,
-      assistantMessage: {
-        role: "assistant",
-        content: message.content ?? "",
-        tool_calls: rawToolCalls,
-      },
-    },
-  };
+  return { id: call.id, name: call.function.name, args: parsed.args };
 }
 
 /**
- * Round 2 — hand the *real* execution results back to the model and ask it to
- * phrase the outcome. Returns null when the model produced no usable text;
- * throws DeepSeekError when the call itself failed.
+ * What one executed tool call hands back: the structured result for the model,
+ * and the human-readable record used to summarise the turn if wording fails.
+ *
+ * Kept structural (rather than importing the Task-aware types) so this module
+ * stays ignorant of what the tools actually do.
  */
-export async function generateReply(
-  continuation: Continuation,
-  toolResults: { toolCallId: string; content: string }[]
-): Promise<string | null> {
-  const data = await postChatCompletion({
-    model: MODEL,
-    messages: [
-      ...continuation.prefixMessages,
-      continuation.assistantMessage,
-      ...toolResults.map((result) => ({
-        role: "tool" as const,
-        tool_call_id: result.toolCallId,
-        content: result.content,
-      })),
-    ],
-    ...NON_THINKING_MODE,
-    temperature: 0.7,
-    max_tokens: 1024,
-  });
+export interface ExecutedTool {
+  payload: Record<string, unknown>;
+  record: { name: string; outcome: string; detail: string };
+}
 
-  return data.choices?.[0]?.message?.content?.trim() || null;
+export interface AgentRunResult {
+  /** The model's closing answer, or null when it never got to write one. */
+  message: string | null;
+  /** Model round-trips actually performed. */
+  steps: number;
+  stopReason: Exclude<StopReason, "error">;
+}
+
+/** Token usage summed across every round-trip of the turn. */
+export interface AgentUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+}
+
+/**
+ * Runs the tool loop until the model stops asking for tools or we run out of
+ * room.
+ *
+ * The active ingredient compared to a single tool round: after each batch the
+ * real results are appended to `msgs` and the model gets to decide *again*.
+ * That is what lets "add a task and mark it done" work — step one returns the
+ * new id, step two spends it.
+ *
+ * `records` and the caller's task state are mutated through `execute`, so a
+ * failure thrown from here still leaves the caller holding every tool call that
+ * did run. Throws `DeepSeekError` when a round-trip fails.
+ */
+export async function runAgentLoop(
+  messages: { role: string; content: string }[],
+  currentTasks: Record<string, unknown>[],
+  timezone: string,
+  execute: (call: ToolInvocation) => ExecutedTool,
+  limits?: { maxSteps?: number; totalBudgetMs?: number }
+): Promise<AgentRunResult> {
+  const maxSteps = limits?.maxSteps ?? MAX_STEPS;
+  const budgetMs = limits?.totalBudgetMs ?? TOTAL_BUDGET_MS;
+  const deadline = Date.now() + budgetMs;
+
+  const msgs = buildChatMessages(messages, currentTasks, timezone);
+
+  let steps = 0;
+  let lastSignature: string | null = null;
+  let repeats = 0;
+
+  for (let step = 1; step <= maxSteps; step += 1) {
+    // Checked before each call, so a slow final request can overshoot slightly.
+    if (Date.now() >= deadline) {
+      return { message: null, steps, stopReason: "deadline" };
+    }
+    steps = step;
+
+    const data = await postChatCompletion({
+      model: MODEL,
+      messages: msgs,
+      tools: TOOLS,
+      tool_choice: "auto",
+      ...NON_THINKING_MODE,
+      temperature: 0.7,
+      max_tokens: 2048,
+    });
+
+    const message = data.choices?.[0]?.message;
+    if (!message) {
+      throw new DeepSeekError("DeepSeek 没有返回任何候选结果", "server");
+    }
+
+    const rawToolCalls = message.tool_calls ?? [];
+
+    if (rawToolCalls.length === 0) {
+      return { message: message.content?.trim() || null, steps, stopReason: "no_tool_calls" };
+    }
+
+    // Echo the assistant turn verbatim, then answer every call id — DeepSeek
+    // rejects a tool_calls turn whose ids are not all followed by a tool
+    // message, so even a skipped call has to be reported back.
+    msgs.push({
+      role: "assistant",
+      content: message.content ?? "",
+      tool_calls: rawToolCalls,
+    });
+
+    for (const raw of rawToolCalls) {
+      const { payload } = execute(toInvocation(raw));
+      msgs.push({
+        role: "tool",
+        tool_call_id: raw.id,
+        content: JSON.stringify(payload),
+      });
+    }
+
+    // Asking for the byte-identical batch twice running means the loop is
+    // spinning, not progressing. Stop before burning the rest of the budget.
+    const signature = rawToolCalls
+      .map((call) => `${call.function.name}:${call.function.arguments}`)
+      .join("|");
+
+    if (signature === lastSignature) {
+      repeats += 1;
+      if (repeats >= NO_PROGRESS_LIMIT) {
+        return { message: null, steps, stopReason: "no_progress" };
+      }
+    } else {
+      lastSignature = signature;
+      repeats = 1;
+    }
+  }
+
+  return { message: null, steps, stopReason: "max_steps" };
 }

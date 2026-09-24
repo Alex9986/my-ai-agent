@@ -121,6 +121,44 @@ export default function AppShell({ username, onLogout }: AppShellProps) {
     },
   });
 
+  // --- Undo for AI-initiated deletes ---
+  // The server signed a token describing what it removed; it holds no copy of
+  // the list, so we hand back what we have and take whatever it returns.
+  const handleAiUndo = useCallback(
+    async (token: string) => {
+      try {
+        const response = await fetch("/api/undo", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token, tasks: tasksRef.current }),
+        });
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok) {
+          throw new Error(
+            typeof data.error === "string" && data.error ? data.error : "撤销失败"
+          );
+        }
+
+        if (Array.isArray(data.tasks)) {
+          replaceAllTasks(data.tasks);
+          toast(
+            data.restored?.title
+              ? `↩️ 已恢复「${data.restored.title}」`
+              : "↩️ 已恢复",
+            "success"
+          );
+        }
+      } catch (error) {
+        toast(
+          error instanceof Error && error.message ? error.message : "撤销失败",
+          "error"
+        );
+      }
+    },
+    [replaceAllTasks, tasksRef, toast]
+  );
+
   // --- Send message to AI ---
   const handleSend = useCallback(
     async (content: string, options?: { retry?: boolean }) => {
@@ -191,12 +229,28 @@ export default function AppShell({ username, onLogout }: AppShellProps) {
         // Adopt the server-returned task list (the hook persists it)
         if (data.tasks) {
           replaceAllTasks(data.tasks);
-          toast(
-            data.degraded
-              ? "AI 回复生成失败，已直接展示实际操作结果"
-              : "AI 已更新任务列表",
-            data.degraded ? "warning" : "success"
-          );
+
+          if (data.undo) {
+            // Something was deleted this turn — the restore offer is the only
+            // thing worth acting on, so it replaces the usual "updated" notice.
+            const undo = data.undo;
+            toast(`🗑️ ${undo.description}`, "info", {
+              duration: 10000,
+              action: {
+                label: "撤销",
+                onClick: () => {
+                  void handleAiUndo(undo.token);
+                },
+              },
+            });
+          } else {
+            toast(
+              data.degraded
+                ? "AI 回复生成失败，已直接展示实际操作结果"
+                : "AI 已更新任务列表",
+              data.degraded ? "warning" : "success"
+            );
+          }
         }
       } catch (error) {
         // Surface the real reason (timeout / rate limit / bad key) instead of
@@ -220,7 +274,7 @@ export default function AppShell({ username, onLogout }: AppShellProps) {
         setLoading(false);
       }
     },
-    [replaceAllTasks, tasksRef, toast]
+    [handleAiUndo, replaceAllTasks, tasksRef, toast]
   );
 
   // --- Direct task actions (server-synced via the hook) ---
@@ -240,13 +294,31 @@ export default function AppShell({ username, onLogout }: AppShellProps) {
 
   const handleDelete = useCallback(
     (id: string) => {
-      const task = tasksRef.current.find((t) => t.id === id);
+      const index = tasksRef.current.findIndex((t) => t.id === id);
+      const task = index === -1 ? undefined : tasksRef.current[index];
+
       deleteTask(id);
-      if (task) {
-        toast(`🗑️ "${task.title}" 已删除`, "info");
-      }
+
+      if (!task) return;
+
+      // A button delete is trivially reversible — the snapshot is already in
+      // hand, so this needs no server round-trip and no token.
+      toast(`🗑️ "${task.title}" 已删除`, "info", {
+        duration: 10000,
+        action: {
+          label: "撤销",
+          onClick: () => {
+            const current = tasksRef.current;
+            if (current.some((t) => t.id === task.id)) return;
+            const next = [...current];
+            next.splice(Math.min(index, next.length), 0, task);
+            replaceAllTasks(next);
+            toast(`↩️ 已恢复「${task.title}」`, "success");
+          },
+        },
+      });
     },
-    [deleteTask, tasksRef, toast]
+    [deleteTask, replaceAllTasks, tasksRef, toast]
   );
 
   const handleUpdate = useCallback(

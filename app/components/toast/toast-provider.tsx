@@ -7,14 +7,29 @@ import { cn } from "@/lib/utils";
 
 type ToastType = "success" | "error" | "info" | "warning";
 
+/** A single call-to-action rendered inside a toast, e.g. "撤销". */
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface ToastItem {
   id: string;
   message: string;
   type: ToastType;
+  action?: ToastAction;
+  duration: number;
+}
+
+interface ToastOptions {
+  /** Adds a button; the toast dismisses itself once it is clicked. */
+  action?: ToastAction;
+  /** Milliseconds before auto-dismiss. Undo offers deserve longer than 4s. */
+  duration?: number;
 }
 
 interface ToastContextValue {
-  toast: (message: string, type?: ToastType) => void;
+  toast: (message: string, type?: ToastType, options?: ToastOptions) => void;
 }
 
 const ToastContext = createContext<ToastContextValue | null>(null);
@@ -24,6 +39,8 @@ export function useToast() {
   if (!ctx) throw new Error("useToast must be used within ToastProvider");
   return ctx;
 }
+
+const DEFAULT_DURATION_MS = 4000;
 
 const iconMap: Record<ToastType, React.ComponentType<{ className?: string }>> = {
   success: CheckCircle2,
@@ -49,19 +66,29 @@ const iconColorMap: Record<ToastType, string> = {
 export function ToastProvider({ children }: { children: ReactNode }) {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
 
-  const addToast = useCallback((message: string, type: ToastType = "info") => {
-    const id = crypto.randomUUID();
-    setToasts((prev) => [...prev, { id, message, type }]);
-
-    // Auto-dismiss after 4 seconds
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 4000);
-  }, []);
-
   const removeToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  const addToast = useCallback(
+    (message: string, type: ToastType = "info", options?: ToastOptions) => {
+      const id = crypto.randomUUID();
+      const duration = options?.duration ?? DEFAULT_DURATION_MS;
+
+      setToasts((prev) => [
+        ...prev,
+        { id, message, type, action: options?.action, duration },
+      ]);
+
+      // Auto-dismiss. An action does not pause this — the offer expires with
+      // its own server-side TTL anyway, and a stuck toast is worse than a
+      // missed one.
+      setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, duration);
+    },
+    []
+  );
 
   return (
     <ToastContext.Provider value={{ toast: addToast }}>
@@ -91,6 +118,17 @@ export function ToastProvider({ children }: { children: ReactNode }) {
               >
                 <Icon className={cn("w-4 h-4 flex-shrink-0 mt-0.5", iconColorMap[t.type])} />
                 <p className="text-xs text-foreground flex-1 leading-relaxed">{t.message}</p>
+                {t.action && (
+                  <button
+                    onClick={() => {
+                      removeToast(t.id);
+                      t.action?.onClick();
+                    }}
+                    className="flex-shrink-0 -mt-0.5 rounded-md px-1.5 py-0.5 text-xs font-medium text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/40 transition-colors"
+                  >
+                    {t.action.label}
+                  </button>
+                )}
                 <button
                   onClick={() => removeToast(t.id)}
                   className="flex-shrink-0 -mr-0.5 -mt-0.5 p-0.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-black/5 dark:hover:bg-white/10 transition-colors"

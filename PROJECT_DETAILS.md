@@ -91,8 +91,9 @@
 ├── app/
 │   ├── api/
 │   │   ├── auth/login/route.ts    # 登录认证 API
-│   │   ├── chat/route.ts           # AI 对话 API（工具调用执行）
-│   │   └── tasks/route.ts          # 任务 CRUD API（CloudBase）
+│   │   ├── chat/route.ts           # AI 对话 API（有界 Agent 循环 + 工具执行）
+│   │   ├── tasks/route.ts          # 任务 CRUD API（CloudBase）
+│   │   └── undo/route.ts           # 撤销删除 API（校验签名令牌）
 │   ├── components/
 │   │   ├── auth/login-form.tsx     # 登录表单
 │   │   ├── chat/
@@ -118,7 +119,8 @@
 ├── components/ui/                  # shadcn/ui 基础组件
 ├── lib/
 │   ├── cloudbase.ts               # CloudBase HTTP API 客户端
-│   ├── deepseek.ts                # DeepSeek AI 客户端
+│   ├── deepseek.ts                # DeepSeek 客户端 + Agent 循环
+│   ├── undo.ts                    # 撤销令牌的签名与校验（HMAC）
 │   ├── task-utils.ts              # 纯函数任务工具
 │   ├── types.ts                   # TypeScript 类型定义
 │   └── utils.ts                   # cn() 工具函数
@@ -130,9 +132,13 @@
 ### 数据流
 
 ```
-[用户输入] → ChatInput → POST /api/chat → DeepSeek API (Function Calling)
-    → 服务端执行工具调用（纯函数） → 返回更新后任务列表
+[用户输入] → ChatInput → POST /api/chat → Agent 循环（≤5 步）：
+      模型决策 → 服务端执行工具（纯函数）→ 真实结果回传模型 → 模型再次决策
+    → 模型不再调用工具时输出最终回复 → 返回更新后任务列表 + steps/stopReason
     → 前端替换全部任务 → 自动同步 PUT /api/tasks → CloudBase
+
+[删除任务] → 响应附带签名 undo 令牌 → Toast 显示「撤销」
+    → POST /api/undo（回传令牌 + 当前列表）→ 返回恢复后的列表
 
 [直接任务操作] → TodoPanel (complete/delete/update)
     → useTasks Hook 更新本地状态
@@ -142,9 +148,13 @@
 ### 关键技术决策
 
 1. **服务端无状态**：AI Chat API 不维护会话状态，依赖客户端每次都发送完整任务列表，设计简洁且易于水平扩展
-2. **纯函数模式**：`lib/task-utils.ts` 中所有任务操作都是纯函数（`Task[] → Task[]`），便于测试和复用
-3. **无 SDK 依赖**：CloudBase 集成完全通过 HTTP API 实现，未引入重量级 SDK，保持依赖精简
-4. **三级降级策略**：确保在各种网络状况下应用均可使用
+2. **有界 Agent 循环**：模型可以「调用工具 → 看到真实结果 → 再决策」，但被步数、总预算和无进展检测三重约束，
+   既拿到多步能力又不会无限烧钱；中断时返回已执行操作的真实摘要，而非丢失工作或谎报成功
+3. **纯函数模式**：`lib/task-utils.ts` 中所有任务操作都是纯函数（`Task[] → Task[]`），便于测试和复用
+4. **撤销令牌而非服务端状态**：删除的可撤销性由 HMAC 签名的短期令牌承载，因此不需要引入
+   会话存储就实现了「误删可恢复」。注意其定位是**完整性**而非授权——客户端本就能提交任意任务列表
+5. **无 SDK 依赖**：CloudBase 集成完全通过 HTTP API 实现，未引入重量级 SDK，保持依赖精简
+6. **三级降级策略**：确保在各种网络状况下应用均可使用
 
 ---
 
@@ -159,8 +169,13 @@
 ### `POST /api/chat`
 - 接收消息历史 + 任务列表 + 时区
 - 调用 DeepSeek API（带 5 个 Function Tools 定义）
-- 两轮调用：第一轮获取 tool_calls，构建 tool 消息后第二轮获取最终回复
-- 执行工具调用操作任务列表，返回完整更新后的列表
+- **有界 Agent 循环**：模型调用工具 → 服务端执行并把真实结果回传 → 模型看到结果后再次决策，
+  直到它不再调用工具，或触达任一上限（默认 5 步 / 45s 总预算 / 重复调用无进展检测）
+- 因此支持依赖前序结果的任务：如"添加一个任务并把它标记完成"，第一步拿到新 id，第二步据此调用
+- 返回完整更新后的任务列表，以及 `steps`（实际步数）与 `stopReason`
+- 循环中断（超时、步数耗尽、模型卡住、生成失败）时不丢弃已完成的工作，
+  而是返回已执行操作的真实摘要，并置 `degraded: true`
+- 若本轮删除了任务，响应附带 `undo` 提议（签名令牌 + 描述 + 过期时间）
 
 ### `GET /api/tasks`
 - 按 `username` 查询 CloudBase `user_tasks` 集合
@@ -170,6 +185,12 @@
 - Upsert 模式：已存在则更新，否则创建
 - 存储 `username` + `tasks[]` + `updatedAt`
 
+### `POST /api/undo`
+- 兑换 `/api/chat` 删除操作返回的签名令牌（HMAC-SHA256，10 分钟有效）
+- 保持服务端无状态：客户端回传当前任务列表，服务端校验令牌后返回恢复后的列表
+- 签名保证恢复的是服务端**真正删除**的那个任务，而非客户端自带的载荷
+- 幂等：同一令牌重复提交不会重复插入；索引越界会被夹到列表末尾
+
 ---
 
 ## 部署与运维
@@ -178,19 +199,26 @@
 - Next.js 应用可部署到 Vercel 或任意支持 Node.js 的平台
 - 数据库初始化脚本 `scripts/seed-demo-users.ts`，运行：`npx tsx scripts/seed-demo-users.ts`
 - 环境变量：`CLOUDBASE_ENV_ID`、`CLOUDBASE_API_KEY`、`DEEPSEEK_API_KEY`
+- 可选环境变量：`DEEPSEEK_MODEL`、`UNDO_SECRET`、`AGENT_MAX_STEPS`、`AGENT_TOTAL_BUDGET_MS`、`AGENT_MAX_HISTORY`
+- ⚠️ 部署到函数超时较短的平台（如 Vercel 默认 10s）时，必须把 `AGENT_TOTAL_BUDGET_MS` 压到平台超时以下，
+  否则多步循环会被平台掐断
 
 ---
 
 ## 项目亮点总结（适合简历）
 
-1. **AI + 传统 CRUD 的融合实践**：不是简单的"ChatBot 问答"，而是 AI Function Calling 驱动真实业务操作
-2. **全栈 TypeScript**：从前端 Hooks 到后端 API Route 到数据库客户端，全链路类型安全
-3. **多层级数据策略**：云端优先 + 本地缓存 + 离线降级，保证应用在各种网络状况下的可用性
-4. **完整的认证体系**：速率限制、跨标签页同步、安全错误消息、演示账户
-5. **精致的 UI/UX**：响应式、暗色模式、Toast 通知、键盘快捷键、Framer Motion 动画过渡
-6. **Serverless 架构**：Next.js API Routes + CloudBase 云数据库，零服务器运维
-7. **无冗余依赖**：CloudBase 通过原生 HTTP API 调用，DeepSeek 通过原生 fetch 调用，未引入重量级 ORM 或 SDK
-8. **组件化与关注点分离**：Custom Hooks 封装业务逻辑、纯函数工具模块、UI 组件纯粹渲染
+1. **AI + 传统 CRUD 的融合实践**：不是简单的"ChatBot 问答"，而是 AI Function Calling 驱动真实业务操作；
+   并且是**多步有界 Agent 循环**——模型能看到工具的真实执行结果再决定下一步，从而完成
+   "添加一个任务并把它标记完成"这类依赖前序结果的链式请求
+2. **危险操作可撤销**：删除不是单向的，AI 删除会附带签名撤销令牌，一处点击即可复原；
+   而这一切在没有引入任何服务端会话状态的前提下实现
+3. **全栈 TypeScript**：从前端 Hooks 到后端 API Route 到数据库客户端，全链路类型安全
+4. **多层级数据策略**：云端优先 + 本地缓存 + 离线降级，保证应用在各种网络状况下的可用性
+5. **完整的认证体系**：速率限制、跨标签页同步、安全错误消息、演示账户
+6. **精致的 UI/UX**：响应式、暗色模式、Toast 通知、键盘快捷键、Framer Motion 动画过渡
+7. **Serverless 架构**：Next.js API Routes + CloudBase 云数据库，零服务器运维
+8. **无冗余依赖**：CloudBase 通过原生 HTTP API 调用，DeepSeek 通过原生 fetch 调用，未引入重量级 ORM 或 SDK
+9. **组件化与关注点分离**：Custom Hooks 封装业务逻辑、纯函数工具模块、UI 组件纯粹渲染
 
 ---
 

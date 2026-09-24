@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  requestIntent,
-  generateReply,
+  runAgentLoop,
   DeepSeekError,
+  type ExecutedTool,
   type ToolInvocation,
 } from "@/lib/deepseek";
 import {
@@ -12,9 +12,11 @@ import {
   completeTaskInList,
   findTasksInList,
   buildFallbackMessage,
+  type FallbackReason,
   type ToolExecutionRecord,
 } from "@/lib/task-utils";
-import { Task, ChatRequest, ChatResponse } from "@/lib/types";
+import { createUndoOffer } from "@/lib/undo";
+import { Task, ChatRequest, ChatResponse, StopReason, UndoOffer } from "@/lib/types";
 
 const PRIORITY_ORDER: Record<Task["priority"], number> = {
   high: 0,
@@ -34,6 +36,8 @@ interface ToolApplication {
   record: ToolExecutionRecord;
   /** Handed back to the model so it can describe the outcome truthfully. */
   payload: Record<string, unknown>;
+  /** Set by destructive tools so the UI can offer a one-click restore. */
+  undo?: UndoOffer;
 }
 
 function isPriority(value: unknown): value is Task["priority"] {
@@ -186,7 +190,8 @@ function applyToolCall(
 
     case "delete_task": {
       const id = asString(args.id);
-      const target = id ? tasks.find((t) => t.id === id) : undefined;
+      const index = id ? tasks.findIndex((t) => t.id === id) : -1;
+      const target = index === -1 ? undefined : tasks[index];
       if (!target || !id) return notFound(tasks, name, id, "删除");
 
       return {
@@ -197,6 +202,8 @@ function applyToolCall(
           detail: `已删除任务「${target.title}」`,
         },
         payload: { success: true, deleted: target.title },
+        // The removal is real; the offer only makes it reversible for a while.
+        undo: createUndoOffer(target, index),
       };
     }
 
@@ -335,6 +342,18 @@ function toClientError(error: DeepSeekError): {
   }
 }
 
+/** Maps a loop stop reason onto the summary wording that explains it. */
+function fallbackReason(stopReason: StopReason): FallbackReason {
+  if (
+    stopReason === "max_steps" ||
+    stopReason === "deadline" ||
+    stopReason === "no_progress"
+  ) {
+    return stopReason;
+  }
+  return "error";
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body: ChatRequest = await request.json();
@@ -358,62 +377,85 @@ export async function POST(request: NextRequest) {
     });
 
     // Build numbered task list for the AI (so it understands "倒数第二个" etc.)
-    const taskContext = sortedTasks.map((t, i) => ({
-      index: i + 1, // 1-based index for natural language reference
-      id: t.id,
-      title: t.title,
-      description: t.description,
-      priority: t.priority,
-      status: t.status,
-      dueDate: t.dueDate,
-      tags: t.tags,
-    }));
+    //
+    // Only the fields needed to pick a task and resolve a position are sent:
+    // `description` is the one unbounded field and is dropped, and optional
+    // fields are omitted rather than emitted as null/[] — this block is resent
+    // on every loop step, so its size compounds with the step count.
+    const taskContext = sortedTasks.map((t, i) => {
+      const row: Record<string, unknown> = {
+        index: i + 1, // 1-based index for natural language reference
+        id: t.id,
+        title: t.title,
+        priority: t.priority,
+        status: t.status,
+      };
+      if (t.dueDate) row.dueDate = t.dueDate;
+      if (t.tags.length > 0) row.tags = t.tags;
+      return row;
+    });
 
     const timezone = body.timezone || "Asia/Shanghai";
 
-    // Step 1 — ask the model what it wants to do. Nothing has been modified yet.
-    const intent = await requestIntent(body.messages, taskContext, timezone);
-
-    // Step 2 — execute the requested tools for real, recording every outcome.
+    // Mutable state shared with the loop: every executed call is applied to the
+    // task list and recorded, so a mid-loop failure still returns the work that
+    // already happened instead of discarding it.
     let updatedTasks: Task[] = clientTasks;
     const records: ToolExecutionRecord[] = [];
-    const toolResults: { toolCallId: string; content: string }[] = [];
+    let undo: UndoOffer | undefined;
 
-    for (const call of intent.toolCalls) {
+    const execute = (call: ToolInvocation): ExecutedTool => {
       const applied = applyCall(call, updatedTasks);
       updatedTasks = applied.tasks;
       records.push(applied.record);
-      toolResults.push({
-        toolCallId: call.id,
-        content: JSON.stringify(applied.payload),
-      });
-    }
+      if (applied.undo) undo = applied.undo;
+      return applied;
+    };
 
-    // Step 3 — let the model phrase the outcome, now with the real results.
     let message: string;
     let degraded = false;
+    let steps = 0;
+    let stopReason: StopReason;
 
-    if (intent.continuation) {
-      try {
-        const reply = await generateReply(intent.continuation, toolResults);
-        if (reply) {
-          message = reply;
-        } else {
-          message = buildFallbackMessage(records);
-          degraded = true;
-        }
-      } catch (error) {
-        // The work is already done — only the wording failed. Say what really
-        // happened instead of a blanket "已经处理完成".
-        console.error("生成回复失败，改用本地结果摘要：", error);
-        message = buildFallbackMessage(records);
+    try {
+      const run = await runAgentLoop(
+        body.messages,
+        taskContext,
+        timezone,
+        execute
+      );
+
+      steps = run.steps;
+      stopReason = run.stopReason;
+
+      if (run.message) {
+        message = run.message;
+      } else {
+        // Ran out of room (or the model went quiet) — report what really ran.
+        message = buildFallbackMessage(records, fallbackReason(run.stopReason));
         degraded = true;
       }
-    } else {
-      message = intent.message ?? buildFallbackMessage(records);
+    } catch (error) {
+      // Tools that already ran must not be thrown away — only the wording
+      // failed, or we ran out of budget partway. A failure before anything was
+      // executed is a genuine request failure and belongs in the error path.
+      if (records.length === 0) throw error;
+
+      console.error("Agent 循环中断，改用本地结果摘要：", error);
+      message = buildFallbackMessage(records, "error");
+      degraded = true;
+      steps = Math.max(steps, 1);
+      stopReason = "error";
     }
 
-    const response: ChatResponse = { message, tasks: updatedTasks, degraded };
+    const response: ChatResponse = {
+      message,
+      tasks: updatedTasks,
+      degraded,
+      steps,
+      stopReason,
+      undo,
+    };
 
     return NextResponse.json(response);
   } catch (error) {
