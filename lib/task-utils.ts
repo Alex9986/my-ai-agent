@@ -67,21 +67,41 @@ export interface ToolExecutionRecord {
 }
 
 /**
+ * Why the loop stopped without a model-written answer. Mirrors the non-success
+ * members of `StopReason`, kept separate so this module stays free of the
+ * transport types.
+ */
+export type FallbackReason = "max_steps" | "deadline" | "no_progress" | "error";
+
+const STOP_NOTICE: Record<FallbackReason, string> = {
+  max_steps: "AI 连续操作的步数达到上限，先停在这里。已经执行的操作如下：",
+  deadline: "AI 处理超时，先停在这里。已经执行的操作如下：",
+  no_progress: "AI 在重复同一个操作，已中止。已经执行的操作如下：",
+  error: "AI 的回复没能生成出来，不过操作已经实际执行了：",
+};
+
+/**
  * Deterministic summary of the executed tool calls.
  *
- * Used as the reply text when the model's follow-up call is unavailable
- * (timeout, retries exhausted, empty completion). The point is honesty: the
- * user sees what the server actually did, not a canned "已经处理完成".
+ * Used as the reply text when the loop stops without a usable model answer —
+ * whether that is a failed round-trip, an exhausted step budget, or a model
+ * that got stuck. The point is honesty: the user sees what the server actually
+ * did, not a canned "已经处理完成".
  */
-export function buildFallbackMessage(records: ToolExecutionRecord[]): string {
+export function buildFallbackMessage(
+  records: ToolExecutionRecord[],
+  reason: FallbackReason = "error"
+): string {
   if (records.length === 0) {
-    return "AI 这会儿没能回复上来，请稍后再试一次。";
+    return reason === "error"
+      ? "AI 这会儿没能回复上来，请稍后再试一次。"
+      : "AI 没能完成这次请求，换个说法再试一次通常就好了。";
   }
 
   const done = records.filter((r) => r.outcome === "ok");
   const skipped = records.filter((r) => r.outcome !== "ok");
 
-  const lines: string[] = ["AI 的回复没能生成出来，不过操作已经实际执行了："];
+  const lines: string[] = [STOP_NOTICE[reason]];
 
   if (done.length > 0) {
     lines.push("", ...done.map((r) => `✅ ${r.detail}`));
